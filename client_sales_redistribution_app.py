@@ -9,7 +9,7 @@ Distribution rules:
   • Customer accounts      → greedy by ARR (equal total customer ARR per rep)
   • Non-customer accounts  → greedy by count (equal volume)
   • Open opps              → follow account assignment (same rep as account)
-  • FY18 Sales Planning    → append 'Prev Acct Owner: <name>' only if no existing tag
+  • FY18 Sales Planning    → always append 'Prev Acct Owner: <name>' (preserves existing tags)
 
 Output:
   • Full Excel  — all original columns + new owner cols + FY18 update
@@ -718,23 +718,16 @@ def detect_fy18_col(df: pd.DataFrame) -> str | None:
             return cols_lower[cand.lower()]
     return None
 
-def apply_fy18_tag(val, tag: str, overwrite_existing: bool = False) -> str:
+def apply_fy18_tag(val, tag: str) -> str:
     """
-    Append 'Prev Acct Owner: <tag>' to the FY18 field.
-    - overwrite_existing=False (default): skip rows that already have 'Prev Acct Owner:'
-    - overwrite_existing=True: replace any existing tag with the new one (Sydney Clawson exception)
+    Always append 'Prev Acct Owner: <tag>' to the FY18 Sales Planning field.
+    Pre-existing tags (e.g. Prev Acct Owner: Bridget Sands) are left untouched;
+    the new tag is added alongside them.
     """
     if pd.isna(val) or str(val).strip() in ("", "nan"):
         return f"Prev Acct Owner: {tag}"
     s = str(val).strip()
-    if "Prev Acct Owner:" in s:
-        if overwrite_existing:
-            # Remove the old tag segment and replace
-            import re as _re
-            s_clean = _re.sub(r",?\s*Prev Acct Owner:[^,]*", "", s).strip().strip(",")
-            return f"{s_clean},Prev Acct Owner: {tag}" if s_clean else f"Prev Acct Owner: {tag}"
-        return s          # already has a tag — leave exactly as-is
-    return f"{s},Prev Acct Owner: {tag}"
+    return f"{s}, Prev Acct Owner: {tag}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DISTRIBUTION LOGIC
@@ -749,8 +742,7 @@ def distribute(acct_df: pd.DataFrame,
                departing_name: str,
                tag_name: str,
                arr_col: str | None,
-               fy18_col: str | None,
-               force_tag_all: bool = False) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame]:
+               fy18_col: str | None) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame]:
     """
     Core distribution engine.
 
@@ -758,7 +750,7 @@ def distribute(acct_df: pd.DataFrame,
     Non-customer accts → greedy by count (equal volume per rep).
     Open opps          → follow their account's new owner.
 
-    force_tag_all=True: overwrite pre-existing Prev Acct Owner tags (Sydney Clawson exception).
+    FY18 tag is always appended; pre-existing tags are preserved alongside it.
 
     Returns (acct_out, opp_out, summary_df).
     """
@@ -771,9 +763,7 @@ def distribute(acct_df: pd.DataFrame,
     # ── 1. Apply FY18 tag ─────────────────────────────────────────────────
     df = acct_df.copy()
     if fy18_col and fy18_col in df.columns:
-        df[fy18_col] = df[fy18_col].apply(
-            lambda v: apply_fy18_tag(v, tag_name, overwrite_existing=force_tag_all)
-        )
+        df[fy18_col] = df[fy18_col].apply(lambda v: apply_fy18_tag(v, tag_name))
 
     # ── 2. Split customers vs others ─────────────────────────────────────
     type_col = _find_col(df, ["type", "account type"])
@@ -1509,17 +1499,6 @@ def main():
                 use_container_width=True
             )
 
-            force_tag_all = st.checkbox(
-                "Overwrite existing Prev Acct Owner tags (apply tag to ALL rows)",
-                value=False,
-                key="force_tag_all",
-                help=(
-                    "By default the tag is only added to rows that don't already have one. "
-                    "Enable this to overwrite pre-existing tags — use when the departing rep "
-                    "inherited pre-tagged rows and you want a clean handoff record."
-                )
-            )
-
             if run_clicked:
                 with st.spinner("Distributing accounts…"):
                     acct_df  = st.session_state.acct_df.copy()
@@ -1534,8 +1513,7 @@ def main():
                     acct_out, opp_out, summary = distribute(
                         acct_df, opp_df, reps,
                         st.session_state.departing_name, tag,
-                        arr_col, fy18_col,
-                        force_tag_all=force_tag_all
+                        arr_col, fy18_col
                     )
 
                     dep = st.session_state.departing_name
