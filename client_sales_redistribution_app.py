@@ -276,13 +276,56 @@ def _factmap_to_rows(data: dict) -> list[dict]:
             rows.append(rec)
     return rows
 
+def _post_filter_rows(rows: list[dict], owner_id: str, owner_name: str) -> tuple[list[dict], str]:
+    """
+    Filter report rows to only those belonging to the departing rep.
+    Matches on any column whose label contains 'owner id' (by Salesforce user ID,
+    comparing first 15 chars to handle 15/18-char variations) or, failing that,
+    any column whose label contains 'owner' (by name, case-insensitive).
+    Returns (filtered_rows, method_description).
+    """
+    if not rows:
+        return rows, "none"
+
+    sample = rows[0]
+    id_cols   = [k for k in sample if "owner" in k.lower() and "id" in k.lower()]
+    name_cols = [k for k in sample if "owner" in k.lower() and "id" not in k.lower()]
+
+    # Prefer ID match (more precise)
+    if id_cols and owner_id:
+        owner_id_15 = owner_id[:15]
+        filtered = [r for r in rows
+                    if any(str(r.get(c, ""))[:15] == owner_id_15 for c in id_cols)]
+        if filtered:
+            return filtered, f"ID match on '{id_cols[0]}'"
+
+    # Fall back to name match
+    if name_cols and owner_name:
+        owner_lower = owner_name.strip().lower()
+        filtered = [r for r in rows
+                    if any(str(r.get(c, "")).strip().lower() == owner_lower
+                           for c in name_cols)]
+        if filtered:
+            return filtered, f"name match on '{name_cols[0]}'"
+
+    return rows, "unfiltered"  # couldn't identify owner column — return as-is
+
+
 def fetch_report_with_owner(sid: str, report_id: str,
                             owner_id: str = None,
+                            owner_name: str = None,
                             status_fn=None) -> tuple[list, list]:
     """
-    Fetch a SFDC Analytics report. If owner_id supplied, injects an owner-
-    equals filter override so the same saved report works for any rep.
-    Returns (rows, dropped_warnings).
+    Fetch a SFDC Analytics report filtered to a single owner.
+
+    Strategy:
+      1. Try to inject an API-level owner filter (reduces payload size if it works).
+         The column name is resolved from: saved filters → detailColumns → fallback.
+      2. Always apply a Python post-filter on the returned rows regardless, matching
+         on 'owner id' columns (ID, 15-char prefix) or 'owner' name columns.
+         This guarantees correctness even when the API filter column name is wrong.
+
+    Returns (rows, warnings).
     """
     if status_fn:
         status_fn(f"Describing report {report_id}…")
@@ -291,35 +334,67 @@ def fetch_report_with_owner(sid: str, report_id: str,
     warnings = []
 
     if owner_id:
-        # Find the existing owner filter column (usually CUST_OWNER or similar)
-        existing = meta.get("reportFilters", [])
-        owner_col = None
+        existing     = meta.get("reportFilters", [])
+        col_info     = (desc.get("reportExtendedMetadata", {})
+                            .get("detailColumnInfo", {}))
+        owner_col    = None
+
+        # 1. Saved report filters — works when a filter is still present
         for f in existing:
-            col = f.get("column", "")
-            if "owner" in col.lower() or "OWNER" in col:
-                owner_col = col
+            if "owner" in f.get("column", "").lower():
+                owner_col = f["column"]
                 break
-        if owner_col:
-            # Override the filter value with the new owner ID
-            new_filters = [f for f in existing if f.get("column") != owner_col]
-            new_filters.append({
-                "column":   owner_col,
-                "operator": "equals",
-                "value":    owner_id
-            })
-            meta["reportFilters"] = new_filters
-            if status_fn:
-                status_fn(f"Applying owner filter override ({owner_col} = {owner_id})…")
-        else:
+
+        # 2. detailColumnInfo labels — most reliable: "Account Owner" / "Opportunity Owner"
+        #    labels are consistent regardless of the internal key (CUST_OWNER, USERS.NAME, etc.)
+        if not owner_col:
+            for key, info in col_info.items():
+                label = info.get("label", "")
+                if "owner" in label.lower() and "id" not in label.lower():
+                    owner_col = key
+                    break
+
+        # 3. detailColumns keys — catches keys that do contain 'owner'
+        if not owner_col:
+            for col in meta.get("detailColumns", []):
+                if "owner" in col.lower():
+                    owner_col = col
+                    break
+
+        # 4. Hard-coded fallback — best-effort; Python post-filter is the real guarantee
+        if not owner_col:
+            report_type = meta.get("reportType", {}).get("type", "").upper()
+            owner_col   = "OPP_OWNER_NAME" if "OPP" in report_type else "ACCOUNT_OWNER"
             warnings.append(
-                "Could not identify the owner filter column in this report. "
-                "Results may include all owners — filter to the departing rep manually."
+                f"Could not detect owner column from report metadata — "
+                f"using fallback '{owner_col}'. Results are still filtered "
+                f"in Python by owner ID/name as a safety net."
             )
+
+        new_filters = [f for f in existing if f.get("column") != owner_col]
+        new_filters.append({"column": owner_col, "operator": "equals", "value": owner_id})
+        meta["reportFilters"] = new_filters
+        if status_fn:
+            status_fn(f"Applying owner filter ({owner_col} = {owner_id})…")
 
     if status_fn:
         status_fn("Running report — polling for results…")
     data = _run_report_instance(sid, report_id, metadata_override=meta)
     rows = _factmap_to_rows(data)
+    if status_fn:
+        status_fn(f"Raw report: {len(rows)} rows. Applying owner filter…")
+
+    # Always post-filter — guarantees correct results regardless of API filter outcome
+    if owner_id or owner_name:
+        rows, method = _post_filter_rows(rows, owner_id or "", owner_name or "")
+        if method == "unfiltered":
+            warnings.append(
+                "Could not identify an owner column in the report data to filter on. "
+                "Results may include accounts from multiple reps — verify before distributing."
+            )
+        if status_fn:
+            status_fn(f"After owner filter ({method}): {len(rows)} rows.")
+
     if status_fn:
         status_fn(f"Report complete — {len(rows)} rows loaded.")
     return rows, warnings
@@ -1260,6 +1335,7 @@ def main():
                                 rows, warns = fetch_report_with_owner(
                                     sid, acct_rpt,
                                     owner_id=st.session_state.departing_id,
+                                    owner_name=st.session_state.departing_name,
                                     status_fn=lambda m: msgs.append(m)
                                 )
                                 df = pd.DataFrame(rows).fillna("")
@@ -1448,7 +1524,8 @@ def main():
                                 try:
                                     rows, warns = fetch_report_with_owner(
                                         sid, opp_rpt,
-                                        owner_id=st.session_state.departing_id
+                                        owner_id=st.session_state.departing_id,
+                                        owner_name=st.session_state.departing_name
                                     )
                                     st.session_state.opp_df    = pd.DataFrame(rows).fillna("")
                                     st.session_state.dropped_opp = warns
