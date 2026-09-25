@@ -247,69 +247,122 @@ def _soql_query_all(sid: str, soql: str, status_fn=None) -> list:
 def _discover_account_fields(sid: str, status_fn=None) -> tuple:
     """
     Single Account/describe call that locates the ARR and FY18 Sales Planning
-    field API names.  Uses a four-pass strategy:
-      1. Exact label match (case-insensitive)
-      2. Partial label match  ('contractual' + 'arr' appear anywhere in label)
-      3. Partial API-name match (same keywords in the internal field name)
-      4. Any currency/number field whose API name contains 'arr'
+    field API names.
+
+    Matching strategy (each pass tried in order, stops at first hit):
+      1. Exact normalized label match against a known-candidate list
+      2. Label contains both 'contractual' and 'arr' (any order)
+      3. API name contains both 'contractual' and 'arr'
+      4. Currency/number/double field whose API name contains 'arr'
+      5. Direct API-name guesses for 'Contractual ARR (converted)' pattern
+
+    If ALL passes fail the function logs every currency/number field it found
+    so the user can identify the right one and enter it in the sidebar override.
+
     Returns (arr_label, arr_api_name, fy18_label, fy18_api_name).
     Any element may be None if not found.
     """
+    import unicodedata
+
+    def _norm(s: str) -> str:
+        """Normalize for comparison: NFKC unicode, lowercase, strip whitespace."""
+        return unicodedata.normalize("NFKC", str(s)).lower().strip()
+
     url = f"{SF_INSTANCE}/services/data/{SF_API_VER}/sobjects/Account/describe"
     r   = requests.get(url, headers=sf_headers(sid), timeout=30)
     r.raise_for_status()
     all_fields = r.json().get("fields", [])
 
-    by_label = {f["label"].lower(): f for f in all_fields}
-    by_name  = {f["name"].lower():  f for f in all_fields}
+    if status_fn:
+        status_fn(f"Account describe returned {len(all_fields)} fields.")
+
+    by_label = {_norm(f["label"]): f for f in all_fields}
+    by_name  = {_norm(f["name"]):  f for f in all_fields}
 
     # ── ARR field ────────────────────────────────────────────────────────────
     arr_result = None
-    # Pass 1 — exact label
+
+    # Pass 1 — exact normalized label match
     for lbl in ["contractual arr (converted)", "contractual arr",
-                "contractual arr usd", "arr", "annual contract value"]:
+                "contractual arr usd", "contractual arr (usd)",
+                "arr", "annual recurring revenue", "annual contract value"]:
         if lbl in by_label:
             arr_result = by_label[lbl]
+            if status_fn:
+                status_fn(f"ARR found (Pass 1 label): {arr_result['label']!r}")
             break
-    # Pass 2 — partial label ("contractual" + "arr" both present)
+
+    # Pass 2 — label contains both 'contractual' and 'arr'
     if not arr_result:
         for f in all_fields:
-            ll = f["label"].lower()
+            ll = _norm(f["label"])
             if "contractual" in ll and "arr" in ll:
                 arr_result = f
+                if status_fn:
+                    status_fn(f"ARR found (Pass 2 partial label): {f['label']!r}")
                 break
-    # Pass 3 — partial API name
+
+    # Pass 3 — API name contains both 'contractual' and 'arr'
     if not arr_result:
         for f in all_fields:
-            nl = f["name"].lower()
+            nl = _norm(f["name"])
             if "contractual" in nl and "arr" in nl:
                 arr_result = f
+                if status_fn:
+                    status_fn(f"ARR found (Pass 3 partial API name): {f['name']!r}")
                 break
-    # Pass 4 — any currency/number field whose API name contains "arr"
+
+    # Pass 4 — any currency/double/number field whose API name contains 'arr'
     if not arr_result:
         for f in all_fields:
-            if (f.get("type") in ("currency", "double", "percent") and
-                    "arr" in f["name"].lower()):
+            if (f.get("type") in ("currency", "double", "percent", "number") and
+                    "arr" in _norm(f["name"])):
                 arr_result = f
+                if status_fn:
+                    status_fn(f"ARR found (Pass 4 type+name): {f['name']!r}")
                 break
+
+    # Pass 5 — try direct API-name guesses derived from known label variants
+    if not arr_result:
+        guess_names = [
+            "contractual_arr__c", "contractual_arr_converted__c",
+            "contractual_arr_usd__c", "contractualarr__c",
+            "contractual_arr_value__c", "arr__c", "contractual_arr_amount__c",
+        ]
+        for nm in guess_names:
+            if nm in by_name:
+                arr_result = by_name[nm]
+                if status_fn:
+                    status_fn(f"ARR found (Pass 5 name guess): {arr_result['name']!r}")
+                break
+
+    # ── If still not found — dump all numeric fields for the user ────────────
+    if not arr_result and status_fn:
+        numeric = [f for f in all_fields
+                   if f.get("type") in ("currency", "double", "percent",
+                                        "number", "int")]
+        status_fn(
+            f"ARR field NOT found after 5 passes. "
+            f"Listing all {len(numeric)} numeric/currency fields below — "
+            f"copy the API Name of your ARR field into the sidebar override:"
+        )
+        for f in numeric:
+            status_fn(f"  Label: {f['label']!r:50s}  API: {f['name']!r}")
 
     # ── FY18 field ───────────────────────────────────────────────────────────
     fy18_result = None
-    # Pass 1 — exact label
-    if "fy18 sales planning" in by_label:
-        fy18_result = by_label["fy18 sales planning"]
-    # Pass 2 — exact API name candidates
+    if _norm("fy18 sales planning") in by_label:
+        fy18_result = by_label[_norm("fy18 sales planning")]
     if not fy18_result:
         for nm in ["fy18_sales_planning__c", "fy18salesplanning__c",
                    "fy18_salesplanning__c"]:
             if nm in by_name:
                 fy18_result = by_name[nm]
                 break
-    # Pass 3 — partial label ("fy18" + "planning" both present)
     if not fy18_result:
         for f in all_fields:
-            ll = f["label"].lower()
-            nl = f["name"].lower()
+            ll = _norm(f["label"])
+            nl = _norm(f["name"])
             if ("fy18" in ll and "planning" in ll) or \
                ("fy18" in nl and "planning" in nl):
                 fy18_result = f
@@ -322,8 +375,8 @@ def _discover_account_fields(sid: str, status_fn=None) -> tuple:
 
     if status_fn:
         status_fn(
-            f"ARR field:  {arr_label!r} → {arr_api!r}  |  "
-            f"FY18 field: {fy18_label!r} → {fy18_api!r}"
+            f"Result — ARR: {arr_label!r} → {arr_api!r}  |  "
+            f"FY18: {fy18_label!r} → {fy18_api!r}"
         )
     return arr_label, arr_api, fy18_label, fy18_api
 
@@ -417,31 +470,98 @@ def fetch_accounts_soql(sid: str, owner_id: str,
 
 
 def fetch_opps_soql(sid: str, owner_id: str,
+                    amount_field_override: str = None,
                     status_fn=None) -> tuple:
     """
-    Fetch all open Opportunities owned by owner_id via SOQL (auto-paginated).
-    Returns (list_of_row_dicts, warnings).
+    Fetch all open Opportunity records owned by owner_id via SOQL.
+    Discovers the Forecast Amount field via Opportunity/describe so the
+    pipeline totals are accurate even when the amount is a custom field.
+    Returns (rows_as_list_of_dicts, warnings).
     """
+    # ── Discover amount field ────────────────────────────────────────────────
+    amt_api   = None
+    amt_label = "Forecast Amount"
+
+    if amount_field_override and amount_field_override.strip():
+        amt_api = amount_field_override.strip()
+        if status_fn:
+            status_fn(f"Opp amount field overridden to: {amt_api}")
+    else:
+        if status_fn:
+            status_fn("Describing Opportunity object to locate amount field…")
+        try:
+            _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
+                    f"/sobjects/Opportunity/describe")
+            _r   = requests.get(_url, headers=sf_headers(sid), timeout=30)
+            _r.raise_for_status()
+            opp_fields = _r.json().get("fields", [])
+            by_lbl = {f["label"].lower(): f for f in opp_fields}
+            by_nm  = {f["name"].lower():  f for f in opp_fields}
+
+            # Pass 1 — exact label candidates
+            for lbl in ["forecast amount", "amount", "deal amount",
+                        "opportunity amount"]:
+                if lbl in by_lbl:
+                    amt_api   = by_lbl[lbl]["name"]
+                    amt_label = by_lbl[lbl]["label"]
+                    break
+            # Pass 2 — partial label ("forecast" + "amount")
+            if not amt_api:
+                for f in opp_fields:
+                    ll = f["label"].lower()
+                    if "forecast" in ll and "amount" in ll:
+                        amt_api   = f["name"]
+                        amt_label = f["label"]
+                        break
+            # Pass 3 — partial API name
+            if not amt_api:
+                for f in opp_fields:
+                    nl = f["name"].lower()
+                    if "forecast" in nl and "amount" in nl:
+                        amt_api   = f["name"]
+                        amt_label = f["label"]
+                        break
+            # Pass 4 — fall back to standard Amount
+            if not amt_api and "amount" in by_nm:
+                amt_api   = "Amount"
+                amt_label = "Forecast Amount"
+
+            if status_fn:
+                status_fn(f"Opp amount field: {amt_label!r} → {amt_api!r}")
+        except Exception as _e:
+            # If describe fails, fall back to standard Amount
+            amt_api   = "Amount"
+            amt_label = "Forecast Amount"
+            if status_fn:
+                status_fn(f"Opp describe failed ({_e}); falling back to Amount.")
+
+    # ── Build SOQL ───────────────────────────────────────────────────────────
+    extra_field = f", {amt_api}" if amt_api and amt_api != "Amount" else ""
     soql = (
         f"SELECT Id, Name, AccountId, Account.Name, Type, "
-        f"CreatedDate, LeadSource, Amount, CloseDate, StageName, "
+        f"CreatedDate, LeadSource, Amount{extra_field}, CloseDate, StageName, "
         f"Owner.Name, OwnerId "
         f"FROM Opportunity "
         f"WHERE OwnerId = '{owner_id}' AND IsClosed = false"
     )
     if status_fn:
-        status_fn(f"Running SOQL query for open opps (owner {owner_id})…")
+        status_fn(f"Querying open opportunities for owner {owner_id}…")
     records = _soql_query_all(sid, soql, status_fn=status_fn)
 
     rows = []
     for rec in records:
         acct  = rec.get("Account") or {}
         owner = rec.get("Owner")   or {}
-        amt   = rec.get("Amount")
+
+        # Prefer the discovered/override amount field; fall back to Amount
+        raw_amt = rec.get(amt_api) if amt_api else None
+        if raw_amt is None:
+            raw_amt = rec.get("Amount")
         try:
-            amt_str = f"USD {float(amt):,.2f}" if amt is not None else ""
+            amt_str = f"USD {float(raw_amt):,.2f}" if raw_amt is not None else ""
         except (TypeError, ValueError):
-            amt_str = str(amt) if amt is not None else ""
+            amt_str = str(raw_amt) if raw_amt is not None else ""
+
         rows.append({
             "ID (18 Char)":        rec.get("Id", ""),
             "Opportunity Name":    rec.get("Name", ""),
@@ -1437,15 +1557,97 @@ def main():
             "ARR field API name",
             value="",
             placeholder="e.g. Contractual_ARR_USD__c",
-            help="If the ARR column shows 'Not found' after fetching, open "
-                 "Fetch details to see which fields were checked, then enter "
-                 "the exact Salesforce API field name here and re-fetch."
+            help="Paste the API Name from the scanner below if auto-discovery fails."
         )
+
+        if st.button("Scan Account fields", use_container_width=True,
+                     help="Lists every numeric/currency field on Account "
+                          "so you can identify the ARR field API name."):
+            if not st.session_state.connected:
+                st.warning("Connect to Salesforce first.")
+            elif not sid:
+                st.warning("Enter Session ID first.")
+            else:
+                with st.spinner("Describing Account object…"):
+                    try:
+                        _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
+                                f"/sobjects/Account/describe")
+                        _r = requests.get(_url, headers=sf_headers(sid), timeout=30)
+                        _r.raise_for_status()
+                        _fields = _r.json().get("fields", [])
+                        _numeric = [
+                            {"Label": f["label"],
+                             "API Name": f["name"],
+                             "Type": f["type"]}
+                            for f in _fields
+                            if f["type"] in ("currency", "double", "int",
+                                             "percent", "number")
+                        ]
+                        if _numeric:
+                            st.dataframe(
+                                pd.DataFrame(_numeric),
+                                hide_index=True,
+                                use_container_width=True
+                            )
+                            st.caption(
+                                "Find your ARR field in the list above, "
+                                "copy its API Name, and paste it into the "
+                                "override box."
+                            )
+                        else:
+                            st.info("No numeric/currency fields visible for "
+                                    "this profile.")
+                    except Exception as _e:
+                        st.error(f"Describe failed: {_e}")
+
+        if st.button("Scan Opp fields", use_container_width=True,
+                     help="Lists every numeric/currency field on Opportunity "
+                          "so you can identify the Forecast Amount field API name."):
+            if not st.session_state.connected:
+                st.warning("Connect to Salesforce first.")
+            elif not sid:
+                st.warning("Enter Session ID first.")
+            else:
+                with st.spinner("Describing Opportunity object…"):
+                    try:
+                        _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
+                                f"/sobjects/Opportunity/describe")
+                        _r = requests.get(_url, headers=sf_headers(sid), timeout=30)
+                        _r.raise_for_status()
+                        _fields = _r.json().get("fields", [])
+                        _numeric = [
+                            {"Label": f["label"],
+                             "API Name": f["name"],
+                             "Type": f["type"]}
+                            for f in _fields
+                            if f["type"] in ("currency", "double", "int",
+                                             "percent", "number")
+                        ]
+                        if _numeric:
+                            st.dataframe(
+                                pd.DataFrame(_numeric),
+                                hide_index=True,
+                                use_container_width=True
+                            )
+                        else:
+                            st.info("No numeric/currency fields visible "
+                                    "for this profile.")
+                    except Exception as _e:
+                        st.error(f"Describe failed: {_e}")
+
+        opp_amount_override = st.text_input(
+            "Opp amount field API name",
+            value="",
+            placeholder="e.g. Forecast_Amount__c",
+            help="Paste the API Name from the Opp scanner above if pipeline "
+                 "shows $0 or is not found."
+        )
+
         st.divider()
         st.markdown(
             "<small>Account and opp data is fetched via SOQL — no row-count "
-            "limits. ARR and FY18 fields are auto-discovered from your org. "
-            "Use the override above if auto-discovery misses the ARR field.</small>",
+            "limits. ARR and Forecast Amount fields are auto-discovered. "
+            "Use the scanners above if auto-discovery misses a field.</small>",
             unsafe_allow_html=True
         )
 
@@ -1572,7 +1774,7 @@ def main():
                                         _warn(w)
                                     if msgs:
                                         with st.expander("Fetch details",
-                                                         expanded=False):
+                                                         expanded=True):
                                             for m in msgs:
                                                 st.caption(m)
                                     st.rerun()
@@ -1758,6 +1960,7 @@ def main():
                                     rows, warns = fetch_opps_soql(
                                         sid,
                                         owner_id=st.session_state.departing_id,
+                                        amount_field_override=opp_amount_override,
                                         status_fn=lambda m: msgs2.append(m)
                                     )
                                     st.session_state.opp_df      = pd.DataFrame(rows).fillna("")
@@ -1767,7 +1970,7 @@ def main():
                                         _warn(w)
                                     if msgs2:
                                         with st.expander("Fetch details",
-                                                         expanded=False):
+                                                         expanded=True):
                                             for m in msgs2:
                                                 st.caption(m)
                                     st.rerun()
