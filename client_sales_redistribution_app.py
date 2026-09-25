@@ -318,82 +318,110 @@ def fetch_report_with_owner(sid: str, report_id: str,
     """
     Fetch a SFDC Analytics report filtered to a single owner.
 
-    Strategy:
-      1. Try to inject an API-level owner filter (reduces payload size if it works).
-         The column name is resolved from: saved filters → detailColumns → fallback.
-      2. Always apply a Python post-filter on the returned rows regardless, matching
-         on 'owner id' columns (ID, 15-char prefix) or 'owner' name columns.
-         This guarantees correctness even when the API filter column name is wrong.
+    Owner column resolution (describe response only — no pre-run needed):
+      1. Existing reportFilters  → column key already known
+      2. reportTypeMetadata.categories columns → label-based search ("Account Owner" etc.)
+         This is the reliable path: labels are consistent, keys vary by org/version.
+      3. detailColumns keys     → catches keys that happen to contain 'owner'
+      4. Hard-coded fallback    → last resort
+
+    Filter value: owner NAME is used (Salesforce User fields in report filters
+    match on name, not ID). Python post-filter then matches by ID as confirmation.
+
+    If the API filter returns 0 rows (wrong column name or no match), the function
+    automatically retries without the owner filter and applies the Python post-filter
+    on the full result set.
 
     Returns (rows, warnings).
     """
     if status_fn:
         status_fn(f"Describing report {report_id}…")
-    desc     = _describe_report(sid, report_id)
-    meta     = desc.get("reportMetadata", {})
-    warnings = []
+    desc         = _describe_report(sid, report_id)
+    meta         = desc.get("reportMetadata", {})
+    warnings     = []
+    api_filtered = False
 
-    if owner_id:
-        existing     = meta.get("reportFilters", [])
-        col_info     = (desc.get("reportExtendedMetadata", {})
-                            .get("detailColumnInfo", {}))
-        owner_col    = None
+    import copy
+    meta_original = copy.deepcopy(meta)   # preserve unfiltered meta for fallback
 
-        # 1. Saved report filters — works when a filter is still present
+    if owner_id or owner_name:
+        existing  = meta.get("reportFilters", [])
+        owner_col = None
+
+        # 1. Saved report filters
         for f in existing:
             if "owner" in f.get("column", "").lower():
                 owner_col = f["column"]
                 break
 
-        # 2. detailColumnInfo labels — most reliable: "Account Owner" / "Opportunity Owner"
-        #    labels are consistent regardless of the internal key (CUST_OWNER, USERS.NAME, etc.)
+        # 2. reportTypeMetadata.categories — available in describe response, label-based
+        #    Most reliable: "Account Owner" / "Opportunity Owner" labels are always consistent
         if not owner_col:
-            for key, info in col_info.items():
-                label = info.get("label", "")
-                if "owner" in label.lower() and "id" not in label.lower():
-                    owner_col = key
+            for cat in desc.get("reportTypeMetadata", {}).get("categories", []):
+                for key, col_def in cat.get("columns", {}).items():
+                    label       = col_def.get("label", "")
+                    filterable  = col_def.get("filterable", True)
+                    if filterable and "owner" in label.lower() and "id" not in label.lower():
+                        owner_col = key
+                        break
+                if owner_col:
                     break
 
-        # 3. detailColumns keys — catches keys that do contain 'owner'
+        # 3. detailColumns keys
         if not owner_col:
             for col in meta.get("detailColumns", []):
                 if "owner" in col.lower():
                     owner_col = col
                     break
 
-        # 4. Hard-coded fallback — best-effort; Python post-filter is the real guarantee
+        # 4. Hard-coded fallback
         if not owner_col:
             report_type = meta.get("reportType", {}).get("type", "").upper()
             owner_col   = "OPP_OWNER_NAME" if "OPP" in report_type else "ACCOUNT_OWNER"
             warnings.append(
-                f"Could not detect owner column from report metadata — "
-                f"using fallback '{owner_col}'. Results are still filtered "
-                f"in Python by owner ID/name as a safety net."
+                f"Owner column not found in report metadata — using fallback '{owner_col}'."
             )
 
-        new_filters = [f for f in existing if f.get("column") != owner_col]
-        new_filters.append({"column": owner_col, "operator": "equals", "value": owner_id})
+        # Use owner NAME as filter value: Salesforce User fields in report filters
+        # match on the user's display name, not their ID.
+        filter_value = owner_name if owner_name else owner_id
+        new_filters  = [f for f in existing if f.get("column") != owner_col]
+        new_filters.append({"column": owner_col, "operator": "equals", "value": filter_value})
         meta["reportFilters"] = new_filters
+        api_filtered = True
         if status_fn:
-            status_fn(f"Applying owner filter ({owner_col} = {owner_id})…")
+            status_fn(f"Applying owner filter: {owner_col} = '{filter_value}'…")
 
     if status_fn:
         status_fn("Running report — polling for results…")
     data = _run_report_instance(sid, report_id, metadata_override=meta)
     rows = _factmap_to_rows(data)
     if status_fn:
-        status_fn(f"Raw report: {len(rows)} rows. Applying owner filter…")
+        status_fn(f"Report returned {len(rows)} rows.")
 
-    # Always post-filter — guarantees correct results regardless of API filter outcome
-    if owner_id or owner_name:
+    # If API filter returned 0 rows, retry without it and rely on Python post-filter
+    if api_filtered and len(rows) == 0:
+        if status_fn:
+            status_fn("0 rows from API filter — fetching full report and filtering in Python…")
+        warnings.append(
+            "API owner filter returned 0 rows (column name mismatch). "
+            "Fetched full report and applied Python filter — results are correct."
+        )
+        data = _run_report_instance(sid, report_id, metadata_override=meta_original)
+        rows = _factmap_to_rows(data)
+        if status_fn:
+            status_fn(f"Full report: {len(rows)} rows. Filtering to owner…")
+
+    # Python post-filter — always applied as final guarantee
+    if rows and (owner_id or owner_name):
         rows, method = _post_filter_rows(rows, owner_id or "", owner_name or "")
+        if status_fn:
+            status_fn(f"After owner filter: {len(rows)} rows ({method}).")
         if method == "unfiltered":
             warnings.append(
-                "Could not identify an owner column in the report data to filter on. "
-                "Results may include accounts from multiple reps — verify before distributing."
+                "No owner column found in report data — results include all owners. "
+                "Verify before distributing."
             )
-        if status_fn:
-            status_fn(f"After owner filter ({method}): {len(rows)} rows.")
 
     if status_fn:
         status_fn(f"Report complete — {len(rows)} rows loaded.")
@@ -1325,8 +1353,10 @@ def main():
                     _warn("Connect to Salesforce first (sidebar).")
                 else:
                     _info(
-                        f"Will fetch report **{acct_rpt}** with an owner filter "
-                        f"overridden to **{st.session_state.departing_id}**."
+                        f"Will fetch report **{acct_rpt}** filtered to "
+                        f"**{st.session_state.departing_name}**. "
+                        f"If the API filter fails, the full report will be fetched "
+                        f"and filtered in Python automatically."
                     )
                     if st.button("Fetch accounts from Salesforce"):
                         with st.spinner("Running report…"):
@@ -1339,11 +1369,16 @@ def main():
                                     status_fn=lambda m: msgs.append(m)
                                 )
                                 df = pd.DataFrame(rows).fillna("")
-                                st.session_state.acct_df    = df
+                                st.session_state.acct_df      = df
                                 st.session_state.dropped_acct = warns
+                                st.session_state.fetch_msgs   = msgs
                                 reset_results()
                                 for w in warns:
                                     _warn(w)
+                                if msgs:
+                                    with st.expander("Fetch details", expanded=False):
+                                        for m in msgs:
+                                            st.caption(m)
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Report fetch failed: {e}")
