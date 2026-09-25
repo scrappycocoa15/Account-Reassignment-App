@@ -218,7 +218,182 @@ def lookup_user_sfdc(sid: str, name_fragment: str) -> list:
     except Exception:
         return []
 
-# ── Report fetching ───────────────────────────────────────────────────────────
+# ── SOQL-based fetching (primary data path) ───────────────────────────────────
+
+def _soql_query_all(sid: str, soql: str, status_fn=None) -> list:
+    """
+    Execute a SOQL query and return ALL records, automatically following
+    nextRecordsUrl pagination.  No row-count cap.
+    """
+    url     = f"{SF_INSTANCE}/services/data/{SF_API_VER}/query"
+    records = []
+    params  = {"q": soql}
+    while True:
+        r = requests.get(url, headers=sf_headers(sid),
+                         params=params, timeout=30)
+        r.raise_for_status()
+        data  = r.json()
+        batch = data.get("records", [])
+        records.extend(batch)
+        if status_fn:
+            status_fn(f"Fetched {len(records):,} records…")
+        if data.get("done", True):
+            break
+        url    = f"{SF_INSTANCE}{data['nextRecordsUrl']}"
+        params = {}
+    return records
+
+
+def _discover_custom_fields(sid: str, sobject: str, labels: list) -> dict:
+    """
+    Describe a SObject and return {label: api_name} for each of the requested
+    labels (case-insensitive match).
+    """
+    url = f"{SF_INSTANCE}/services/data/{SF_API_VER}/sobjects/{sobject}/describe"
+    r   = requests.get(url, headers=sf_headers(sid), timeout=30)
+    r.raise_for_status()
+    fields     = r.json().get("fields", [])
+    want_lower = {lbl.lower(): lbl for lbl in labels}
+    found      = {}
+    for f in fields:
+        key = f["label"].lower()
+        if key in want_lower:
+            found[want_lower[key]] = f["name"]
+    return found  # {original_label: api_name}
+
+
+def fetch_accounts_soql(sid: str, owner_id: str,
+                        status_fn=None) -> tuple:
+    """
+    Fetch every Account owned by owner_id via SOQL (auto-paginated, no row cap).
+
+    Custom fields (Contractual ARR, FY18 Sales Planning) are discovered from
+    the Account object describe so the resulting column labels match what
+    detect_arr_col() and detect_fy18_col() expect.
+
+    Returns (list_of_row_dicts, warnings).
+    """
+    warnings_out = []
+
+    if status_fn:
+        status_fn("Discovering Account custom fields via describe…")
+
+    custom = _discover_custom_fields(sid, "Account", [
+        "Contractual ARR (converted)",
+        "Contractual ARR",
+        "FY18 Sales Planning",
+    ])
+
+    arr_label = (
+        "Contractual ARR (converted)" if "Contractual ARR (converted)" in custom
+        else "Contractual ARR"        if "Contractual ARR"             in custom
+        else None
+    )
+    arr_field  = custom.get(arr_label) if arr_label else None
+    fy18_field = custom.get("FY18 Sales Planning")
+
+    select_parts = [
+        "Id", "Name", "OwnerId", "Owner.Name", "Owner.Manager.Name",
+        "Type", "Rating", "LastActivityDate",
+    ]
+    if arr_field:
+        select_parts.append(arr_field)
+    if fy18_field:
+        select_parts.append(fy18_field)
+
+    soql = (f"SELECT {', '.join(select_parts)} "
+            f"FROM Account WHERE OwnerId = '{owner_id}'")
+
+    if status_fn:
+        status_fn(f"Running SOQL query for owner {owner_id}…")
+    records = _soql_query_all(sid, soql, status_fn=status_fn)
+
+    rows = []
+    for rec in records:
+        owner = rec.get("Owner") or {}
+        mgr   = owner.get("Manager") or {}
+        row   = {
+            "18 Digit Account ID": rec.get("Id", ""),
+            "Account Name":        rec.get("Name", ""),
+            "Account Owner":       owner.get("Name", ""),
+            "Account Owner ID":    rec.get("OwnerId", ""),
+            "Manager":             mgr.get("Name", ""),
+            "Type":                rec.get("Type",   "") or "",
+            "Rating":              rec.get("Rating", "") or "",
+            "Last Activity":       str(rec.get("LastActivityDate") or ""),
+        }
+        if arr_field:
+            val = rec.get(arr_field)
+            try:
+                row[arr_label] = f"USD {float(val):,.2f}" if val is not None else ""
+            except (TypeError, ValueError):
+                row[arr_label] = str(val) if val is not None else ""
+        if fy18_field:
+            val = rec.get(fy18_field)
+            row["FY18 Sales Planning"] = str(val) if val is not None else ""
+        rows.append(row)
+
+    if not arr_field:
+        warnings_out.append(
+            "No Contractual ARR field found on Account — customers will be "
+            "distributed by count only."
+        )
+    if not fy18_field:
+        warnings_out.append(
+            "FY18 Sales Planning field not found on Account — tagging will be skipped."
+        )
+
+    if status_fn:
+        status_fn(f"Done — {len(rows):,} accounts loaded.")
+    return rows, warnings_out
+
+
+def fetch_opps_soql(sid: str, owner_id: str,
+                    status_fn=None) -> tuple:
+    """
+    Fetch all open Opportunities owned by owner_id via SOQL (auto-paginated).
+    Returns (list_of_row_dicts, warnings).
+    """
+    soql = (
+        f"SELECT Id, Name, AccountId, Account.Name, Type, "
+        f"CreatedDate, LeadSource, Amount, CloseDate, StageName, "
+        f"Owner.Name, OwnerId "
+        f"FROM Opportunity "
+        f"WHERE OwnerId = '{owner_id}' AND IsClosed = false"
+    )
+    if status_fn:
+        status_fn(f"Running SOQL query for open opps (owner {owner_id})…")
+    records = _soql_query_all(sid, soql, status_fn=status_fn)
+
+    rows = []
+    for rec in records:
+        acct  = rec.get("Account") or {}
+        owner = rec.get("Owner")   or {}
+        amt   = rec.get("Amount")
+        try:
+            amt_str = f"USD {float(amt):,.2f}" if amt is not None else ""
+        except (TypeError, ValueError):
+            amt_str = str(amt) if amt is not None else ""
+        rows.append({
+            "ID (18 Char)":        rec.get("Id", ""),
+            "Opportunity Name":    rec.get("Name", ""),
+            "18 Digit Account ID": rec.get("AccountId", ""),
+            "Account Name":        acct.get("Name", ""),
+            "Type":                rec.get("Type", "") or "",
+            "Created Date":        str(rec.get("CreatedDate") or ""),
+            "Lead Source":         rec.get("LeadSource", "") or "",
+            "Forecast Amount":     amt_str,
+            "Close Date":          str(rec.get("CloseDate") or ""),
+            "Stage":               rec.get("StageName", "") or "",
+            "Opportunity Owner":   owner.get("Name", ""),
+        })
+
+    if status_fn:
+        status_fn(f"Done — {len(rows):,} open opportunities loaded.")
+    return rows, []
+
+
+# ── Analytics API (kept as reference / fallback) ──────────────────────────────
 
 def _describe_report(sid: str, report_id: str) -> dict:
     url = f"{SF_INSTANCE}/services/data/{SF_API_VER}/analytics/reports/{report_id}/describe"
@@ -1181,14 +1356,10 @@ def main():
             st.error(st.session_state.conn_msg)
 
         st.divider()
-        st.markdown("### Report IDs")
-        acct_rpt = st.text_input("Account report", value=DEFAULT_ACCT_RPT)
-        opp_rpt  = st.text_input("Open pipeline report", value=DEFAULT_OPP_RPT)
-
-        st.divider()
         st.markdown(
-            "<small>Reports are fetched via the Analytics API with a dynamic "
-            "owner filter — no need to edit the saved report.</small>",
+            "<small>Account and opportunity data is fetched directly via SOQL — "
+            "bypasses all Analytics API row limits. Custom fields (Contractual ARR, "
+            "FY18 Sales Planning) are auto-discovered from your org.</small>",
             unsafe_allow_html=True
         )
 
@@ -1287,34 +1458,39 @@ def main():
                 if not st.session_state.connected:
                     _warn("Connect to Salesforce first (sidebar).")
                 else:
-                    _info(
-                        f"Will fetch report **{acct_rpt}** (full report — "
-                        f"owner filter applied in Python after fetch)."
-                    )
-                    if st.button("Fetch accounts from Salesforce"):
-                        with st.spinner("Running report…"):
-                            try:
-                                msgs = []
-                                rows, warns = fetch_report_with_owner(
-                                    sid, acct_rpt,
-                                    owner_id=st.session_state.departing_id,
-                                    owner_name=st.session_state.departing_name,
-                                    status_fn=lambda m: msgs.append(m)
-                                )
-                                df = pd.DataFrame(rows).fillna("")
-                                st.session_state.acct_df      = df
-                                st.session_state.dropped_acct = warns
-                                st.session_state.fetch_msgs   = msgs
-                                reset_results()
-                                for w in warns:
-                                    _warn(w)
-                                if msgs:
-                                    with st.expander("Fetch details", expanded=False):
-                                        for m in msgs:
-                                            st.caption(m)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Report fetch failed: {e}")
+                    if not st.session_state.departing_id:
+                        _warn("Enter the departing rep's Salesforce User ID in Step 1.")
+                    else:
+                        _info(
+                            f"Queries Salesforce directly via SOQL — all accounts "
+                            f"owned by <strong>{st.session_state.departing_name}</strong> "
+                            f"({st.session_state.departing_id}). "
+                            f"No row-count limit. Custom fields auto-discovered."
+                        )
+                        if st.button("Fetch accounts from Salesforce"):
+                            with st.spinner("Querying accounts…"):
+                                try:
+                                    msgs = []
+                                    rows, warns = fetch_accounts_soql(
+                                        sid,
+                                        owner_id=st.session_state.departing_id,
+                                        status_fn=lambda m: msgs.append(m)
+                                    )
+                                    df = pd.DataFrame(rows).fillna("")
+                                    st.session_state.acct_df      = df
+                                    st.session_state.dropped_acct = warns
+                                    st.session_state.fetch_msgs   = msgs
+                                    reset_results()
+                                    for w in warns:
+                                        _warn(w)
+                                    if msgs:
+                                        with st.expander("Fetch details",
+                                                         expanded=False):
+                                            for m in msgs:
+                                                st.caption(m)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Account fetch failed: {e}")
 
     if step2_done:
         df = st.session_state.acct_df
@@ -1484,25 +1660,32 @@ def main():
                         _warn("Connect to Salesforce first (sidebar).")
                     else:
                         _info(
-                            f"Will fetch report **{opp_rpt}** with the same "
-                            "owner filter override."
+                            f"Queries Salesforce directly via SOQL — all open "
+                            f"opportunities owned by "
+                            f"<strong>{st.session_state.departing_name}</strong>."
                         )
                         if st.button("Fetch opps from Salesforce"):
-                            with st.spinner("Running opp report…"):
+                            with st.spinner("Querying open opportunities…"):
                                 try:
-                                    rows, warns = fetch_report_with_owner(
-                                        sid, opp_rpt,
+                                    msgs2 = []
+                                    rows, warns = fetch_opps_soql(
+                                        sid,
                                         owner_id=st.session_state.departing_id,
-                                        owner_name=st.session_state.departing_name
+                                        status_fn=lambda m: msgs2.append(m)
                                     )
-                                    st.session_state.opp_df    = pd.DataFrame(rows).fillna("")
+                                    st.session_state.opp_df      = pd.DataFrame(rows).fillna("")
                                     st.session_state.dropped_opp = warns
                                     reset_results()
                                     for w in warns:
                                         _warn(w)
+                                    if msgs2:
+                                        with st.expander("Fetch details",
+                                                         expanded=False):
+                                            for m in msgs2:
+                                                st.caption(m)
                                     st.rerun()
                                 except Exception as e:
-                                    st.error(f"Opp report fetch failed: {e}")
+                                    st.error(f"Opp fetch failed: {e}")
 
                 if st.session_state.opp_df is not None:
                     n_opps = len(st.session_state.opp_df)
