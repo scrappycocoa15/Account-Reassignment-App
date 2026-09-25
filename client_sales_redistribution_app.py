@@ -244,25 +244,92 @@ def _soql_query_all(sid: str, soql: str, status_fn=None) -> list:
     return records
 
 
-def _discover_custom_fields(sid: str, sobject: str, labels: list) -> dict:
+def _discover_account_fields(sid: str, status_fn=None) -> tuple:
     """
-    Describe a SObject and return {label: api_name} for each of the requested
-    labels (case-insensitive match).
+    Single Account/describe call that locates the ARR and FY18 Sales Planning
+    field API names.  Uses a four-pass strategy:
+      1. Exact label match (case-insensitive)
+      2. Partial label match  ('contractual' + 'arr' appear anywhere in label)
+      3. Partial API-name match (same keywords in the internal field name)
+      4. Any currency/number field whose API name contains 'arr'
+    Returns (arr_label, arr_api_name, fy18_label, fy18_api_name).
+    Any element may be None if not found.
     """
-    url = f"{SF_INSTANCE}/services/data/{SF_API_VER}/sobjects/{sobject}/describe"
+    url = f"{SF_INSTANCE}/services/data/{SF_API_VER}/sobjects/Account/describe"
     r   = requests.get(url, headers=sf_headers(sid), timeout=30)
     r.raise_for_status()
-    fields     = r.json().get("fields", [])
-    want_lower = {lbl.lower(): lbl for lbl in labels}
-    found      = {}
-    for f in fields:
-        key = f["label"].lower()
-        if key in want_lower:
-            found[want_lower[key]] = f["name"]
-    return found  # {original_label: api_name}
+    all_fields = r.json().get("fields", [])
+
+    by_label = {f["label"].lower(): f for f in all_fields}
+    by_name  = {f["name"].lower():  f for f in all_fields}
+
+    # ── ARR field ────────────────────────────────────────────────────────────
+    arr_result = None
+    # Pass 1 — exact label
+    for lbl in ["contractual arr (converted)", "contractual arr",
+                "contractual arr usd", "arr", "annual contract value"]:
+        if lbl in by_label:
+            arr_result = by_label[lbl]
+            break
+    # Pass 2 — partial label ("contractual" + "arr" both present)
+    if not arr_result:
+        for f in all_fields:
+            ll = f["label"].lower()
+            if "contractual" in ll and "arr" in ll:
+                arr_result = f
+                break
+    # Pass 3 — partial API name
+    if not arr_result:
+        for f in all_fields:
+            nl = f["name"].lower()
+            if "contractual" in nl and "arr" in nl:
+                arr_result = f
+                break
+    # Pass 4 — any currency/number field whose API name contains "arr"
+    if not arr_result:
+        for f in all_fields:
+            if (f.get("type") in ("currency", "double", "percent") and
+                    "arr" in f["name"].lower()):
+                arr_result = f
+                break
+
+    # ── FY18 field ───────────────────────────────────────────────────────────
+    fy18_result = None
+    # Pass 1 — exact label
+    if "fy18 sales planning" in by_label:
+        fy18_result = by_label["fy18 sales planning"]
+    # Pass 2 — exact API name candidates
+    if not fy18_result:
+        for nm in ["fy18_sales_planning__c", "fy18salesplanning__c",
+                   "fy18_salesplanning__c"]:
+            if nm in by_name:
+                fy18_result = by_name[nm]
+                break
+    # Pass 3 — partial label ("fy18" + "planning" both present)
+    if not fy18_result:
+        for f in all_fields:
+            ll = f["label"].lower()
+            nl = f["name"].lower()
+            if ("fy18" in ll and "planning" in ll) or \
+               ("fy18" in nl and "planning" in nl):
+                fy18_result = f
+                break
+
+    arr_label  = arr_result["label"]  if arr_result  else None
+    arr_api    = arr_result["name"]   if arr_result  else None
+    fy18_label = fy18_result["label"] if fy18_result else None
+    fy18_api   = fy18_result["name"]  if fy18_result else None
+
+    if status_fn:
+        status_fn(
+            f"ARR field:  {arr_label!r} → {arr_api!r}  |  "
+            f"FY18 field: {fy18_label!r} → {fy18_api!r}"
+        )
+    return arr_label, arr_api, fy18_label, fy18_api
 
 
 def fetch_accounts_soql(sid: str, owner_id: str,
+                        arr_field_override: str = None,
                         status_fn=None) -> tuple:
     """
     Fetch every Account owned by owner_id via SOQL (auto-paginated, no row cap).
@@ -276,21 +343,17 @@ def fetch_accounts_soql(sid: str, owner_id: str,
     warnings_out = []
 
     if status_fn:
-        status_fn("Discovering Account custom fields via describe…")
+        status_fn("Describing Account object to locate ARR and FY18 fields…")
 
-    custom = _discover_custom_fields(sid, "Account", [
-        "Contractual ARR (converted)",
-        "Contractual ARR",
-        "FY18 Sales Planning",
-    ])
-
-    arr_label = (
-        "Contractual ARR (converted)" if "Contractual ARR (converted)" in custom
-        else "Contractual ARR"        if "Contractual ARR"             in custom
-        else None
+    arr_label, arr_field, fy18_label, fy18_field = _discover_account_fields(
+        sid, status_fn=status_fn
     )
-    arr_field  = custom.get(arr_label) if arr_label else None
-    fy18_field = custom.get("FY18 Sales Planning")
+    # Apply manual override if the user supplied one
+    if arr_field_override and arr_field_override.strip():
+        arr_field = arr_field_override.strip()
+        arr_label = "Contractual ARR (converted)"
+        if status_fn:
+            status_fn(f"ARR field overridden to: {arr_field}")
 
     select_parts = [
         "Id", "Name", "OwnerId", "Owner.Name", "Owner.Manager.Name",
@@ -325,11 +388,16 @@ def fetch_accounts_soql(sid: str, owner_id: str,
         if arr_field:
             val = rec.get(arr_field)
             try:
-                row[arr_label] = f"USD {float(val):,.2f}" if val is not None else ""
+                # Always store under "Contractual ARR (converted)" so detect_arr_col()
+                # finds it regardless of how the field is labeled in this org.
+                row["Contractual ARR (converted)"] = (
+                    f"USD {float(val):,.2f}" if val is not None else ""
+                )
             except (TypeError, ValueError):
-                row[arr_label] = str(val) if val is not None else ""
+                row["Contractual ARR (converted)"] = str(val) if val is not None else ""
         if fy18_field:
             val = rec.get(fy18_field)
+            # Always store under the canonical label detect_fy18_col() expects.
             row["FY18 Sales Planning"] = str(val) if val is not None else ""
         rows.append(row)
 
@@ -995,7 +1063,15 @@ def distribute(acct_df: pd.DataFrame,
         cust_df["_arr"] = 0.0
     cust_df = cust_df.sort_values("_arr", ascending=False)
 
-    total_arr    = cust_df["_arr"].sum() if len(cust_df) else 0.0
+    total_arr = cust_df["_arr"].sum() if len(cust_df) else 0.0
+
+    # If no ARR data is available, collapse customers into the count pool —
+    # avoids the greedy algorithm degenerate case where target_arr == 0 causes
+    # every iteration to pick the same (first) rep.
+    if total_arr == 0 and len(cust_df) > 0:
+        other_df = pd.concat([cust_df, other_df])
+        cust_df  = cust_df.iloc[:0]   # empty
+
     total_count  = len(other_df)
     n            = len(rep_names)
     target_arr   = total_arr   / n if n else 1.0
@@ -1003,14 +1079,14 @@ def distribute(acct_df: pd.DataFrame,
 
     assignments = {}
 
-    # Greedy by ARR for customers
+    # Greedy by ARR for customers (only runs when ARR data is present)
     for idx, row in cust_df.iterrows():
         arr  = row.get("_arr", 0.0)
-        best = min(rep_names, key=lambda r: arr_by_rep[r] / target_arr if target_arr else 0)
+        best = min(rep_names, key=lambda r: arr_by_rep[r] / target_arr)
         assignments[idx] = best
         arr_by_rep[best] += arr
 
-    # Greedy by count for non-customers
+    # Greedy by count for non-customers (and customers when ARR unavailable)
     for idx, _ in other_df.iterrows():
         best = min(rep_names, key=lambda r: count_by_rep[r] / target_count if target_count else 0)
         assignments[idx] = best
@@ -1356,10 +1432,20 @@ def main():
             st.error(st.session_state.conn_msg)
 
         st.divider()
+        st.markdown("### Field Overrides")
+        arr_field_override = st.text_input(
+            "ARR field API name",
+            value="",
+            placeholder="e.g. Contractual_ARR_USD__c",
+            help="If the ARR column shows 'Not found' after fetching, open "
+                 "Fetch details to see which fields were checked, then enter "
+                 "the exact Salesforce API field name here and re-fetch."
+        )
+        st.divider()
         st.markdown(
-            "<small>Account and opportunity data is fetched directly via SOQL — "
-            "bypasses all Analytics API row limits. Custom fields (Contractual ARR, "
-            "FY18 Sales Planning) are auto-discovered from your org.</small>",
+            "<small>Account and opp data is fetched via SOQL — no row-count "
+            "limits. ARR and FY18 fields are auto-discovered from your org. "
+            "Use the override above if auto-discovery misses the ARR field.</small>",
             unsafe_allow_html=True
         )
 
@@ -1474,6 +1560,7 @@ def main():
                                     rows, warns = fetch_accounts_soql(
                                         sid,
                                         owner_id=st.session_state.departing_id,
+                                        arr_field_override=arr_field_override,
                                         status_fn=lambda m: msgs.append(m)
                                     )
                                     df = pd.DataFrame(rows).fillna("")
@@ -1695,8 +1782,8 @@ def main():
                                    if opp_arr_col else 0.0)
                     _metrics_row(
                         _metric("Open Opps", n_opps, green=True),
-                        _metric("Total Pipeline",
-                                f"${total_pipe:,.0f}") if total_pipe else _metric("Pipeline", "No ARR col"),
+                        _metric("Forecast Amount",
+                                f"${total_pipe:,.0f}" if opp_arr_col else "—"),
                     )
                     _info(
                         "Opps will be assigned to the same rep as their account. "
