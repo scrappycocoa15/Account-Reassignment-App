@@ -244,7 +244,8 @@ def _soql_query_all(sid: str, soql: str, status_fn=None) -> list:
     return records
 
 
-def _discover_account_fields(sid: str, status_fn=None) -> tuple:
+def _discover_account_fields(sid: str, owner_id: str = None,
+                             status_fn=None) -> tuple:
     """
     Single Account/describe call that locates the ARR and FY18 Sales Planning
     field API names.
@@ -255,6 +256,7 @@ def _discover_account_fields(sid: str, status_fn=None) -> tuple:
       3. API name contains both 'contractual' and 'arr'
       4. Currency/number/double field whose API name contains 'arr'
       5. Direct API-name guesses for 'Contractual ARR (converted)' pattern
+      6. SOQL probe — tries common API-name patterns directly on a live record
 
     If ALL passes fail the function logs every currency/number field it found
     so the user can identify the right one and enter it in the sidebar override.
@@ -262,11 +264,14 @@ def _discover_account_fields(sid: str, status_fn=None) -> tuple:
     Returns (arr_label, arr_api_name, fy18_label, fy18_api_name).
     Any element may be None if not found.
     """
-    import unicodedata
+    import unicodedata, re
 
     def _norm(s: str) -> str:
-        """Normalize for comparison: NFKC unicode, lowercase, strip whitespace."""
-        return unicodedata.normalize("NFKC", str(s)).lower().strip()
+        """Normalize for comparison: NFKC unicode, collapse all whitespace,
+        lowercase, strip.  Handles non-breaking spaces, double spaces, tabs."""
+        s = unicodedata.normalize("NFKC", str(s))
+        s = re.sub(r"\s+", " ", s)          # collapse runs of whitespace
+        return s.lower().strip()
 
     url = f"{SF_INSTANCE}/services/data/{SF_API_VER}/sobjects/Account/describe"
     r   = requests.get(url, headers=sf_headers(sid), timeout=30)
@@ -336,13 +341,37 @@ def _discover_account_fields(sid: str, status_fn=None) -> tuple:
                     status_fn(f"ARR found (Pass 5 name guess): {arr_result['name']!r}")
                 break
 
+    # Pass 6 — live SOQL probe: try each candidate API name against one real
+    # record.  This bypasses FLS/describe issues — if the field is queryable
+    # via SOQL it will be found here even if describe didn't surface it.
+    if not arr_result and owner_id:
+        probe_names = [
+            "Contractual_ARR__c", "Contractual_ARR_converted__c",
+            "Contractual_ARR_USD__c", "ContractualARR__c",
+            "Contractual_ARR_Value__c", "ARR__c",
+        ]
+        for cand in probe_names:
+            try:
+                test_soql = (f"SELECT {cand} FROM Account "
+                             f"WHERE OwnerId = '{owner_id}' LIMIT 1")
+                test_recs = _soql_query_all(sid, test_soql)
+                if test_recs and test_recs[0].get(cand) is not None:
+                    # Found a field that is queryable and has a value
+                    arr_result = {"label": "Contractual ARR (converted)",
+                                  "name": cand, "type": "currency"}
+                    if status_fn:
+                        status_fn(f"ARR found (Pass 6 SOQL probe): {cand!r}")
+                    break
+            except Exception:
+                pass   # field doesn't exist or not accessible — try next
+
     # ── If still not found — dump all numeric fields for the user ────────────
     if not arr_result and status_fn:
         numeric = [f for f in all_fields
                    if f.get("type") in ("currency", "double", "percent",
                                         "number", "int")]
         status_fn(
-            f"ARR field NOT found after 5 passes. "
+            f"ARR field NOT found after 6 passes. "
             f"Listing all {len(numeric)} numeric/currency fields below — "
             f"copy the API Name of your ARR field into the sidebar override:"
         )
@@ -399,7 +428,7 @@ def fetch_accounts_soql(sid: str, owner_id: str,
         status_fn("Describing Account object to locate ARR and FY18 fields…")
 
     arr_label, arr_field, fy18_label, fy18_field = _discover_account_fields(
-        sid, status_fn=status_fn
+        sid, owner_id=owner_id, status_fn=status_fn
     )
     # Apply manual override if the user supplied one
     if arr_field_override and arr_field_override.strip():
