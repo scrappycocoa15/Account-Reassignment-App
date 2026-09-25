@@ -247,19 +247,24 @@ def _soql_query_all(sid: str, soql: str, status_fn=None) -> list:
 def _discover_account_fields(sid: str, owner_id: str = None,
                              status_fn=None) -> tuple:
     """
-    Single Account/describe call that locates the ARR and FY18 Sales Planning
-    field API names.
+    Locates the Contractual ARR and FY18 Sales Planning field API names for
+    Account.  Uses a multi-pass strategy; stops at first successful detection:
 
-    Matching strategy (each pass tried in order, stops at first hit):
-      1. Exact normalized label match against a known-candidate list
-      2. Label contains both 'contractual' and 'arr' (any order)
-      3. API name contains both 'contractual' and 'arr'
-      4. Currency/number/double field whose API name contains 'arr'
-      5. Direct API-name guesses for 'Contractual ARR (converted)' pattern
-      6. SOQL probe — tries common API-name patterns directly on a live record
+      Pass 0. FIELDS(CUSTOM) / FIELDS(ALL) SOQL probe — reads a live Account
+              record and scans ALL accessible field keys for ARR-like names.
+              Completely bypasses describe FLS restrictions.
+      Pass 1. Exact normalized label match against a known-candidate list.
+      Pass 2. Label contains both 'contractual' and 'arr'.
+      Pass 3. API name contains both 'contractual' and 'arr'.
+      Pass 4. Currency/number/double field whose API name contains 'arr'.
+      Pass 5. Direct API-name guesses for common Contractual ARR patterns.
+      Pass 6. Per-candidate SOQL probe — confirms field accessibility without
+              requiring a non-null value (many accounts may legitimately
+              have null ARR).
 
-    If ALL passes fail the function logs every currency/number field it found
-    so the user can identify the right one and enter it in the sidebar override.
+    If all passes fail, logs every numeric/currency field from describe and
+    the best FIELDS(ALL) candidate (if any) so the user can copy the correct
+    API name into the sidebar override box.
 
     Returns (arr_label, arr_api_name, fy18_label, fy18_api_name).
     Any element may be None if not found.
@@ -286,6 +291,56 @@ def _discover_account_fields(sid: str, owner_id: str = None,
 
     # ── ARR field ────────────────────────────────────────────────────────────
     arr_result = None
+
+    # Pass 0 — FIELDS(CUSTOM) / FIELDS(ALL) probe
+    # SELECT FIELDS(CUSTOM) bypasses describe FLS entirely.  We scan the
+    # returned record's keys for any field whose API name contains "arr" or
+    # "contractual".  We pick the first non-null numeric hit; if all matching
+    # fields are null we still record the best candidate so it can be used.
+    _fields_all_candidate = None   # best guess even if value is null
+    if owner_id:
+        for _fkw in ("FIELDS(CUSTOM)", "FIELDS(ALL)"):
+            try:
+                _fsql = (f"SELECT {_fkw} FROM Account "
+                         f"WHERE OwnerId = '{owner_id}' LIMIT 5")
+                _frecs = _soql_query_all(sid, _fsql)
+                if _frecs:
+                    # Collect all non-attribute keys from all sample records.
+                    # Prefer keys where any record has a non-null numeric value.
+                    _candidate_keys = {}  # key → best_value
+                    for _rec in _frecs:
+                        for _k, _v in _rec.items():
+                            if _k == "attributes":
+                                continue
+                            if _k not in _candidate_keys and isinstance(_v, (int, float)):
+                                _candidate_keys[_k] = _v
+                            elif _k not in _candidate_keys:
+                                _candidate_keys[_k] = _v
+
+                    # Score keys: prefer those with "arr"/"contractual" in name
+                    for _k, _v in _candidate_keys.items():
+                        _kl = _k.lower()
+                        if ("arr" in _kl or "contractual" in _kl):
+                            if _v is not None and isinstance(_v, (int, float)):
+                                # Non-null numeric hit — use immediately
+                                arr_result = {"label": _k, "name": _k,
+                                              "type": "currency"}
+                                if status_fn:
+                                    status_fn(
+                                        f"ARR found (Pass 0 {_fkw}): "
+                                        f"{_k!r} = {_v}")
+                                break
+                            elif _fields_all_candidate is None:
+                                # Null but looks right — remember as fallback
+                                _fields_all_candidate = _k
+                    if arr_result:
+                        break
+                if arr_result:
+                    break
+            except Exception as _fe:
+                if status_fn:
+                    status_fn(f"Pass 0 {_fkw} failed: {_fe}")
+                continue
 
     # Pass 1 — exact normalized label match
     for lbl in ["contractual arr (converted)", "contractual arr",
@@ -341,42 +396,71 @@ def _discover_account_fields(sid: str, owner_id: str = None,
                     status_fn(f"ARR found (Pass 5 name guess): {arr_result['name']!r}")
                 break
 
-    # Pass 6 — live SOQL probe: try each candidate API name against one real
-    # record.  This bypasses FLS/describe issues — if the field is queryable
-    # via SOQL it will be found here even if describe didn't surface it.
+    # Pass 6 — live SOQL probe: try each candidate API name against a real
+    # record.  Existence is confirmed when the query returns without a SOQL
+    # error — we no longer require a non-null value (many accounts legitimately
+    # have null ARR, which caused the old check to discard a valid field name).
     if not arr_result and owner_id:
         probe_names = [
-            "Contractual_ARR__c", "Contractual_ARR_converted__c",
-            "Contractual_ARR_USD__c", "ContractualARR__c",
-            "Contractual_ARR_Value__c", "ARR__c",
+            # Most common SAP Concur patterns first
+            "Contractual_ARR__c",
+            "Contractual_ARR_converted__c",
+            "Contractual_ARR_USD__c",
+            "ContractualARR__c",
+            "Contractual_ARR_Value__c",
+            "Contractual_ARR_Amount__c",
+            "Contractual_Annual_Recurring_Revenue__c",
+            "CARR__c",
+            "C_ARR__c",
+            "Contract_ARR__c",
+            "ARR__c",
+            "Annual_Recurring_Revenue__c",
+            "Annual_Contract_Value__c",
         ]
+        # If FIELDS(ALL) surfaced a likely candidate name, prepend it
+        if _fields_all_candidate and _fields_all_candidate not in probe_names:
+            probe_names.insert(0, _fields_all_candidate)
         for cand in probe_names:
             try:
                 test_soql = (f"SELECT {cand} FROM Account "
                              f"WHERE OwnerId = '{owner_id}' LIMIT 1")
                 test_recs = _soql_query_all(sid, test_soql)
-                if test_recs and test_recs[0].get(cand) is not None:
-                    # Found a field that is queryable and has a value
-                    arr_result = {"label": "Contractual ARR (converted)",
-                                  "name": cand, "type": "currency"}
-                    if status_fn:
-                        status_fn(f"ARR found (Pass 6 SOQL probe): {cand!r}")
-                    break
+                # If query ran without raising an exception the field exists
+                # and is accessible — value may legitimately be null.
+                val_sample = test_recs[0].get(cand) if test_recs else None
+                arr_result = {"label": "Contractual ARR (converted)",
+                              "name": cand, "type": "currency"}
+                if status_fn:
+                    status_fn(
+                        f"ARR found (Pass 6 SOQL probe): {cand!r} "
+                        f"(sample value: {val_sample!r})")
+                break
             except Exception:
                 pass   # field doesn't exist or not accessible — try next
 
-    # ── If still not found — dump all numeric fields for the user ────────────
-    if not arr_result and status_fn:
-        numeric = [f for f in all_fields
-                   if f.get("type") in ("currency", "double", "percent",
-                                        "number", "int")]
-        status_fn(
-            f"ARR field NOT found after 6 passes. "
-            f"Listing all {len(numeric)} numeric/currency fields below — "
-            f"copy the API Name of your ARR field into the sidebar override:"
-        )
-        for f in numeric:
-            status_fn(f"  Label: {f['label']!r:50s}  API: {f['name']!r}")
+    # ── If still not found — try FIELDS(ALL) null candidate, then dump list ──
+    if not arr_result:
+        # Last resort: if Pass 0 found a key that looks right but had null values,
+        # use it anyway (field exists; accounts may just have no ARR data yet).
+        if _fields_all_candidate:
+            arr_result = {"label": "Contractual ARR (converted)",
+                          "name": _fields_all_candidate, "type": "currency"}
+            if status_fn:
+                status_fn(
+                    f"ARR field (all-null fallback from FIELDS probe): "
+                    f"{_fields_all_candidate!r}"
+                )
+        elif status_fn:
+            numeric = [f for f in all_fields
+                       if f.get("type") in ("currency", "double", "percent",
+                                            "number", "int")]
+            status_fn(
+                f"ARR field NOT found after all passes. "
+                f"Listing all {len(numeric)} numeric/currency fields below — "
+                f"copy the API Name of your ARR field into the sidebar override:"
+            )
+            for f in numeric:
+                status_fn(f"  Label: {f['label']!r:50s}  API: {f['name']!r}")
 
     # ── FY18 field ───────────────────────────────────────────────────────────
     fy18_result = None
@@ -550,7 +634,90 @@ def fetch_opps_soql(sid: str, owner_id: str,
                         amt_api   = f["name"]
                         amt_label = f["label"]
                         break
-            # Pass 4 — fall back to standard Amount
+
+            # Pass 3b — FIELDS(CUSTOM) probe on a live opp record
+            # Bypasses describe FLS; scans for numeric keys with "forecast",
+            # "amount", "arr", or "revenue" in the API name.
+            if not amt_api:
+                _opp_fc_candidate = None
+                for _fkw in ("FIELDS(CUSTOM)", "FIELDS(ALL)"):
+                    try:
+                        _osql = (
+                            f"SELECT {_fkw} FROM Opportunity "
+                            f"WHERE OwnerId = '{owner_id}' "
+                            f"AND IsClosed = false LIMIT 5"
+                        )
+                        _orecs = _soql_query_all(sid, _osql)
+                        if _orecs:
+                            for _orec in _orecs:
+                                for _k, _v in _orec.items():
+                                    if _k == "attributes":
+                                        continue
+                                    _kl = _k.lower()
+                                    if any(t in _kl for t in
+                                           ("forecast", "amount", "arr", "revenue")):
+                                        if _v is not None and isinstance(_v, (int, float)) and _v != 0:
+                                            amt_api   = _k
+                                            amt_label = _k
+                                            if status_fn:
+                                                status_fn(
+                                                    f"Opp amount found "
+                                                    f"({_fkw}): {_k!r} = {_v}")
+                                            break
+                                        elif _opp_fc_candidate is None and isinstance(_v, (int, float)):
+                                            _opp_fc_candidate = _k
+                                if amt_api:
+                                    break
+                        if amt_api:
+                            break
+                    except Exception:
+                        continue
+                # If FIELDS probe found only a null/zero candidate, record it
+                if not amt_api and _opp_fc_candidate:
+                    amt_api   = _opp_fc_candidate
+                    amt_label = _opp_fc_candidate
+                    if status_fn:
+                        status_fn(
+                            f"Opp amount field (null fallback from FIELDS probe): "
+                            f"{_opp_fc_candidate!r}"
+                        )
+
+            # Pass 4 — SOQL probe: try common custom field API names directly.
+            # A clean SOQL run (no exception) confirms the field is accessible,
+            # regardless of whether the sample value is null or zero.
+            if not amt_api:
+                _opp_probe_names = [
+                    "Forecast_Amount__c",
+                    "ForecastAmount__c",
+                    "Forecast_ARR__c",
+                    "Expected_ARR__c",
+                    "Expected_Amount__c",
+                    "Total_Contract_Value__c",
+                    "TCV__c",
+                    "Deal_Amount__c",
+                    "Opportunity_Amount__c",
+                ]
+                for _cand in _opp_probe_names:
+                    try:
+                        _osql = (
+                            f"SELECT {_cand} FROM Opportunity "
+                            f"WHERE OwnerId = '{owner_id}' "
+                            f"AND IsClosed = false LIMIT 1"
+                        )
+                        _orecs = _soql_query_all(sid, _osql)
+                        _v_sample = _orecs[0].get(_cand) if _orecs else None
+                        amt_api   = _cand
+                        amt_label = "Forecast Amount"
+                        if status_fn:
+                            status_fn(
+                                f"Opp amount found (Pass 4 SOQL probe): "
+                                f"{_cand!r} (sample: {_v_sample!r})"
+                            )
+                        break
+                    except Exception:
+                        pass
+
+            # Pass 5 — fall back to standard Amount field
             if not amt_api and "amount" in by_nm:
                 amt_api   = "Amount"
                 amt_label = "Forecast Amount"
@@ -1597,8 +1764,9 @@ def main():
             elif not sid:
                 st.warning("Enter Session ID first.")
             else:
-                with st.spinner("Describing Account object…"):
+                with st.spinner("Scanning Account fields…"):
                     try:
+                        # ── Describe-based list ──────────────────────────────
                         _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
                                 f"/sobjects/Account/describe")
                         _r = requests.get(_url, headers=sf_headers(sid), timeout=30)
@@ -1613,19 +1781,53 @@ def main():
                                              "percent", "number")
                         ]
                         if _numeric:
+                            st.caption("Numeric/currency fields from describe:")
                             st.dataframe(
                                 pd.DataFrame(_numeric),
                                 hide_index=True,
                                 use_container_width=True
                             )
                             st.caption(
-                                "Find your ARR field in the list above, "
-                                "copy its API Name, and paste it into the "
-                                "override box."
+                                "Find your ARR field above, copy its API Name, "
+                                "and paste it into the override box."
                             )
                         else:
-                            st.info("No numeric/currency fields visible for "
-                                    "this profile.")
+                            st.info("No numeric/currency fields visible via describe "
+                                    "for this profile — running FIELDS(CUSTOM) probe.")
+
+                        # ── FIELDS(CUSTOM) live probe (bypasses describe FLS) ─
+                        _dep_id = st.session_state.get("departing_id", "")
+                        if _dep_id:
+                            try:
+                                _fsql = (f"SELECT FIELDS(CUSTOM) FROM Account "
+                                         f"WHERE OwnerId = '{_dep_id}' LIMIT 1")
+                                _frecs = _soql_query_all(sid, _fsql)
+                                if _frecs:
+                                    _sample = _frecs[0]
+                                    _live_rows = [
+                                        {"API Name": k,
+                                         "Sample Value": v}
+                                        for k, v in _sample.items()
+                                        if k != "attributes"
+                                        and isinstance(v, (int, float, type(None)))
+                                    ]
+                                    if _live_rows:
+                                        st.caption(
+                                            "Custom fields (live FIELDS(CUSTOM) probe "
+                                            "— bypasses FLS):"
+                                        )
+                                        st.dataframe(
+                                            pd.DataFrame(_live_rows),
+                                            hide_index=True,
+                                            use_container_width=True
+                                        )
+                            except Exception as _fe:
+                                st.caption(f"FIELDS(CUSTOM) probe: {_fe}")
+                        else:
+                            st.caption(
+                                "Enter the departing rep in Step 1 first to "
+                                "enable the live FIELDS(CUSTOM) probe."
+                            )
                     except Exception as _e:
                         st.error(f"Describe failed: {_e}")
 
@@ -1637,7 +1839,7 @@ def main():
             elif not sid:
                 st.warning("Enter Session ID first.")
             else:
-                with st.spinner("Describing Opportunity object…"):
+                with st.spinner("Scanning Opportunity fields…"):
                     try:
                         _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
                                 f"/sobjects/Opportunity/describe")
@@ -1653,14 +1855,50 @@ def main():
                                              "percent", "number")
                         ]
                         if _numeric:
+                            st.caption("Numeric/currency fields from describe:")
                             st.dataframe(
                                 pd.DataFrame(_numeric),
                                 hide_index=True,
                                 use_container_width=True
                             )
                         else:
-                            st.info("No numeric/currency fields visible "
-                                    "for this profile.")
+                            st.info("No numeric/currency fields visible via describe — "
+                                    "running FIELDS(CUSTOM) probe.")
+
+                        # ── FIELDS(CUSTOM) live probe ────────────────────────
+                        _dep_id = st.session_state.get("departing_id", "")
+                        if _dep_id:
+                            try:
+                                _osql = (
+                                    f"SELECT FIELDS(CUSTOM) FROM Opportunity "
+                                    f"WHERE OwnerId = '{_dep_id}' "
+                                    f"AND IsClosed = false LIMIT 1"
+                                )
+                                _orecs = _soql_query_all(sid, _osql)
+                                if _orecs:
+                                    _osample = _orecs[0]
+                                    _olive = [
+                                        {"API Name": k, "Sample Value": v}
+                                        for k, v in _osample.items()
+                                        if k != "attributes"
+                                        and isinstance(v, (int, float, type(None)))
+                                    ]
+                                    if _olive:
+                                        st.caption(
+                                            "Custom fields (live FIELDS(CUSTOM) probe):"
+                                        )
+                                        st.dataframe(
+                                            pd.DataFrame(_olive),
+                                            hide_index=True,
+                                            use_container_width=True
+                                        )
+                            except Exception as _fe:
+                                st.caption(f"FIELDS(CUSTOM) probe: {_fe}")
+                        else:
+                            st.caption(
+                                "Enter the departing rep in Step 1 first to "
+                                "enable the live FIELDS(CUSTOM) probe."
+                            )
                     except Exception as _e:
                         st.error(f"Describe failed: {_e}")
 
