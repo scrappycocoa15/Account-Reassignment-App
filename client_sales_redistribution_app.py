@@ -295,10 +295,11 @@ def _discover_account_fields(sid: str, owner_id: str = None,
 
     # Pass 0 — FIELDS(CUSTOM) / FIELDS(ALL) probe
     # SELECT FIELDS(CUSTOM) bypasses describe FLS entirely.  We scan the
-    # returned record's keys for any field whose API name contains "arr" or
-    # "contractual".  We pick the first non-null numeric hit; if all matching
-    # fields are null we still record the best candidate so it can be used.
-    _fields_all_candidate = None   # best guess even if value is null
+    # returned record's keys for ARR-like names (numeric) and FY18-like names
+    # (any type — it is a text field).  Candidates are used immediately if a
+    # good match is found, or stored as fallbacks for later passes.
+    _fields_all_candidate = None   # ARR best guess even if value is null
+    _fy18_candidate       = None   # FY18 best guess from FIELDS probe
     if owner_id:
         for _fkw in ("FIELDS(CUSTOM)", "FIELDS(ALL)"):
             try:
@@ -318,7 +319,7 @@ def _discover_account_fields(sid: str, owner_id: str = None,
                             elif _k not in _candidate_keys:
                                 _candidate_keys[_k] = _v
 
-                    # Score keys: prefer those with "arr"/"contractual" in name
+                    # Score keys: ARR (numeric) and FY18 (any type)
                     for _k, _v in _candidate_keys.items():
                         _kl = _k.lower()
                         if ("arr" in _kl or "contractual" in _kl):
@@ -334,6 +335,10 @@ def _discover_account_fields(sid: str, owner_id: str = None,
                             elif _fields_all_candidate is None:
                                 # Null but looks right — remember as fallback
                                 _fields_all_candidate = _k
+                        if "fy18" in _kl and _fy18_candidate is None:
+                            _fy18_candidate = _k
+                            if status_fn:
+                                status_fn(f"FY18 candidate (Pass 0 {_fkw}): {_k!r}")
                     if arr_result:
                         break
                 if arr_result:
@@ -465,14 +470,17 @@ def _discover_account_fields(sid: str, owner_id: str = None,
 
     # ── FY18 field ───────────────────────────────────────────────────────────
     fy18_result = None
+    # Pass A — exact label
     if _norm("fy18 sales planning") in by_label:
         fy18_result = by_label[_norm("fy18 sales planning")]
+    # Pass B — known API name guesses in describe
     if not fy18_result:
         for nm in ["fy18_sales_planning__c", "fy18salesplanning__c",
-                   "fy18_salesplanning__c"]:
+                   "fy18_salesplanning__c", "fy18_sales_plan__c"]:
             if nm in by_name:
                 fy18_result = by_name[nm]
                 break
+    # Pass C — any describe field with "fy18" in label or name
     if not fy18_result:
         for f in all_fields:
             ll = _norm(f["label"])
@@ -481,6 +489,36 @@ def _discover_account_fields(sid: str, owner_id: str = None,
                ("fy18" in nl and "planning" in nl):
                 fy18_result = f
                 break
+    # Pass D — SOQL existence probe (same approach as ARR Pass 6)
+    if not fy18_result and owner_id:
+        fy18_probe_names = [
+            "FY18_Sales_Planning__c",
+            "FY18SalesPlanning__c",
+            "FY18_SalesPlanning__c",
+            "FY18_Sales_Plan__c",
+            "FY18__c",
+        ]
+        if _fy18_candidate and _fy18_candidate not in fy18_probe_names:
+            fy18_probe_names.insert(0, _fy18_candidate)
+        for _cand in fy18_probe_names:
+            try:
+                _tsql = (f"SELECT {_cand} FROM Account "
+                         f"WHERE OwnerId = '{owner_id}' LIMIT 1")
+                _soql_query_all(sid, _tsql)
+                # Query ran without error → field exists and is accessible
+                fy18_result = {"label": "FY18 Sales Planning",
+                               "name": _cand, "type": "string"}
+                if status_fn:
+                    status_fn(f"FY18 found (Pass D SOQL probe): {_cand!r}")
+                break
+            except Exception:
+                pass
+    # Pass E — use FIELDS(CUSTOM) candidate as last resort
+    if not fy18_result and _fy18_candidate:
+        fy18_result = {"label": "FY18 Sales Planning",
+                       "name": _fy18_candidate, "type": "string"}
+        if status_fn:
+            status_fn(f"FY18 found (Pass E FIELDS candidate): {_fy18_candidate!r}")
 
     arr_label  = arr_result["label"]  if arr_result  else None
     arr_api    = arr_result["name"]   if arr_result  else None
@@ -1554,11 +1592,14 @@ def _arr_col_for_fs(df: pd.DataFrame) -> str | None:
     return None
 
 def make_fs_acct_df(acct_df: pd.DataFrame) -> pd.DataFrame:
-    arr_col = _arr_col_for_fs(acct_df)
-    cols    = [c for c in _FS_ACCT_REQUIRED if c in acct_df.columns]
+    arr_col  = _arr_col_for_fs(acct_df)
+    fy18_col = detect_fy18_col(acct_df)
+    cols = [c for c in _FS_ACCT_REQUIRED if c in acct_df.columns]
     if arr_col and arr_col not in cols:
         cols.append(arr_col)
-    # Account Owner original
+    if fy18_col and fy18_col not in cols:
+        cols.append(fy18_col)
+    # Preserve original owner for Field Services reference
     if "Account Owner" in acct_df.columns and "Account Owner" not in cols:
         cols.insert(0, "Account Owner")
     return acct_df[cols].copy()
