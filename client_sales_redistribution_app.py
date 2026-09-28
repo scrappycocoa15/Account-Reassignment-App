@@ -1332,13 +1332,27 @@ def detect_fy18_col(df: pd.DataFrame) -> str | None:
 
 def apply_fy18_tag(val, tag: str) -> str:
     """
-    Always append 'Prev Acct Owner: <tag>' to the FY18 Sales Planning field.
-    Pre-existing tags (e.g. Prev Acct Owner: Bridget Sands) are left untouched;
-    the new tag is added alongside them.
+    Conditionally add 'Prev Acct Owner: <tag>' to the FY18 Sales Planning field.
+
+    Rules:
+      1. If the field already contains a 'Prev Acct Owner:' tag → leave it
+         completely unchanged.  The account was temporarily on this rep's book
+         and already has its real original owner recorded.
+      2. If the field is empty → set it to 'Prev Acct Owner: <tag>'.
+      3. If the field has other content but no Prev Acct Owner tag → append
+         ', Prev Acct Owner: <tag>' after the existing text.
     """
-    if pd.isna(val) or str(val).strip() in ("", "nan"):
+    s = "" if (pd.isna(val) or str(val).strip() in ("", "nan")) else str(val).strip()
+
+    # Rule 1 — already tagged from a prior redistribution, do not touch
+    if "prev acct owner:" in s.lower():
+        return s
+
+    # Rule 2 — empty field
+    if not s:
         return f"Prev Acct Owner: {tag}"
-    s = str(val).strip()
+
+    # Rule 3 — has other content, append
     return f"{s}, Prev Acct Owner: {tag}"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1372,15 +1386,13 @@ def distribute(acct_df: pd.DataFrame,
     arr_by_rep   = defaultdict(float)
     count_by_rep = defaultdict(int)
 
-    # ── 1. Apply FY18 tag (always — creates column if not already present) ──
+    # ── 1. Apply FY18 tag ─────────────────────────────────────────────────
     df = acct_df.copy()
     if fy18_col and fy18_col in df.columns:
-        # Column was fetched from Salesforce — append tag to existing value
+        # Column was fetched from Salesforce — apply conditional tag logic
         df[fy18_col] = df[fy18_col].apply(lambda v: apply_fy18_tag(v, tag_name))
-    else:
-        # Column not in fetched data — create it so the output file always
-        # contains the FY18 Sales Planning instruction for Field Services
-        df["FY18 Sales Planning"] = f"Prev Acct Owner: {tag_name}"
+    # If fy18_col is None the field wasn't fetched; skip tagging entirely
+    # rather than risk overwriting an existing Prev Acct Owner tag we can't see.
 
     # ── 2. Split customers vs others ─────────────────────────────────────
     type_col = _find_col(df, ["type", "account type"])
