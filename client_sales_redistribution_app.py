@@ -158,6 +158,7 @@ _DEFAULTS = {
     "departing_name":   "",
     "departing_id":     "",
     "tag_name":         "",
+    "sender_name":      "",
     "receiving_reps":   [],    # list of {"name": .., "id": ..}
     "include_opps":     False,
     "result_full":      None,  # bytes
@@ -1371,10 +1372,15 @@ def distribute(acct_df: pd.DataFrame,
     arr_by_rep   = defaultdict(float)
     count_by_rep = defaultdict(int)
 
-    # ── 1. Apply FY18 tag ─────────────────────────────────────────────────
+    # ── 1. Apply FY18 tag (always — creates column if not already present) ──
     df = acct_df.copy()
     if fy18_col and fy18_col in df.columns:
+        # Column was fetched from Salesforce — append tag to existing value
         df[fy18_col] = df[fy18_col].apply(lambda v: apply_fy18_tag(v, tag_name))
+    else:
+        # Column not in fetched data — create it so the output file always
+        # contains the FY18 Sales Planning instruction for Field Services
+        df["FY18 Sales Planning"] = f"Prev Acct Owner: {tag_name}"
 
     # ── 2. Split customers vs others ─────────────────────────────────────
     type_col = _find_col(df, ["type", "account type"])
@@ -1670,26 +1676,31 @@ def build_excel(acct_df: pd.DataFrame,
 # ─────────────────────────────────────────────────────────────────────────────
 def compose_mailto(departing_name: str, n_accts: int,
                    n_opps: int, include_opps: bool,
-                   filename: str) -> str:
+                   filename: str,
+                   sender_name: str = "") -> str:
+    """Build a mailto: URI for the Field Services email."""
     subject = f"Territory Reassignment — {departing_name}"
-    body_lines = [
-        f"Hi Field Services team,",
-        "",
-        f"Please find attached the territory reassignment file for {departing_name}.",
-        "",
-        f"  Accounts to reassign : {n_accts}",
+
+    # Build the conditional numbered action list
+    actions = [
+        "Reassign the accounts",
+        "Update the FY18 Sales Planning field",
     ]
-    if include_opps:
-        body_lines.append(f"  Open opps to reassign: {n_opps}")
-    body_lines += [
-        "",
-        f"Attachment: {filename}",
-        "",
-        "Please process the ownership changes at your earliest convenience.",
-        "",
-        "Thank you,",
-    ]
-    body = "\n".join(body_lines)
+    if include_opps and n_opps > 0:
+        actions.append("Reassign the opportunities")
+
+    numbered = "\n".join(f"{i + 1}. {a}" for i, a in enumerate(actions))
+    sig = sender_name.strip() if sender_name.strip() else "[Your name]"
+
+    body = (
+        "Hi team,\n"
+        "\n"
+        "Please make the following updates using the attached file:\n"
+        f"{numbered}\n"
+        "\n"
+        "Thanks,\n"
+        f"{sig}"
+    )
     return (f"mailto:{FS_EMAIL}"
             f"?subject={urllib.parse.quote(subject)}"
             f"&body={urllib.parse.quote(body)}")
@@ -2386,13 +2397,21 @@ def main():
                 use_container_width=True,
             )
         with dl3:
+            sender_input = st.text_input(
+                "Your name (email signature)",
+                value=st.session_state.sender_name,
+                placeholder="e.g. Naman",
+                key="sender_name_input",
+            )
+            st.session_state.sender_name = sender_input
             n_accts = int(total_row["Accounts Assigned"])
             n_opps  = int(total_row["Opps Assigned"])
             mailto  = compose_mailto(
                 st.session_state.departing_name,
                 n_accts, n_opps,
                 st.session_state.include_opps,
-                fs_fname
+                fs_fname,
+                sender_name=st.session_state.sender_name,
             )
             st.link_button(
                 "Compose Email to Field Services",
