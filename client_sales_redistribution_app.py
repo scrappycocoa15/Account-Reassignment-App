@@ -1291,11 +1291,25 @@ def detect_arr_col(df: pd.DataFrame) -> str | None:
     return None
 
 def parse_arr(val) -> float:
+    """Parse an ARR value to float.
+
+    Handles all formats the app may store or receive:
+      • Plain float/int already:  55235.76         → 55235.76
+      • SOQL formatted string:   "USD 55,235.76"   → 55235.76
+      • Dollar-sign format:      "$55,235.76"      → 55235.76
+      • Plain number string:     "55235.76"        → 55235.76
+      • Empty / null / nan:                        → 0.0
+    """
     if val is None:
         return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
     s = str(val).strip()
     if s in ("", "nan", "None", "-"):
         return 0.0
+    # Strip any leading 3-letter currency code (USD, EUR, GBP …) + whitespace
+    s = re.sub(r'^[A-Za-z]{3}\s+', '', s)
+    # Strip remaining symbols: commas, dollar signs, stray spaces
     s = re.sub(r"[,$\s]", "", s)
     try:
         return float(s)
@@ -2061,7 +2075,7 @@ def main():
             _metric("Accounts", len(df)),
             _metric("Customers", n_cust, green=True),
             _metric("Non-Customers", n_other),
-            _metric("Total ARR", f"${total_arr:,.0f}") if total_arr else _metric("ARR col", "Not found"),
+            _metric("Total ARR", f"${total_arr:,.0f}") if arr_col else _metric("ARR col", "Not found"),
         )
         if not arr_col:
             _warn("No ARR column detected — customers will be distributed by count only.")
