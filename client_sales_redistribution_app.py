@@ -586,7 +586,7 @@ def fetch_accounts_soql(sid: str, owner_id: str,
             "Account Owner":       owner.get("Name", ""),
             "Account Owner ID":    rec.get("OwnerId", ""),
             "Manager":             mgr.get("Name", ""),
-            "Type":                rec.get("Type",   "") or "",
+            "Account Type":        rec.get("Type",   "") or "",
             "Rating":              rec.get("Rating", "") or "",
             "Last Activity":       str(rec.get("LastActivityDate") or ""),
         }
@@ -1577,7 +1577,7 @@ def _insert_after(df: pd.DataFrame, after_col: str,
 # FS SLIM DATAFRAME  (required fields only)
 # ─────────────────────────────────────────────────────────────────────────────
 _FS_ACCT_REQUIRED = [
-    "18 Digit Account ID", "Account Name",
+    "18 Digit Account ID", "Account Name", "Account Type",
     "New Account Owner Name", "New Account Owner ID",
 ]
 _FS_OPP_REQUIRED  = [
@@ -2130,7 +2130,7 @@ def main():
         df = st.session_state.acct_df
         arr_col  = detect_arr_col(df)
         fy18_col = detect_fy18_col(df)
-        type_col = _find_col(df, ["type"])
+        type_col = _find_col(df, ["account type", "type"])
         n_cust   = int(df[type_col].apply(_is_customer).sum()) if type_col else 0
         n_other  = len(df) - n_cust
         total_arr = df[arr_col].apply(parse_arr).sum() if arr_col else 0.0
