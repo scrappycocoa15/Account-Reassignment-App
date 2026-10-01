@@ -1645,7 +1645,7 @@ _FS_ACCT_REQUIRED = [
     "New Account Owner Name", "New Account Owner ID",
 ]
 _FS_OPP_REQUIRED  = [
-    "18 Digit Account ID", "Opportunity Name", "Account Name",
+    "ID (18 Char)", "18 Digit Account ID", "Opportunity Name", "Account Name",
     "New Opp Owner Name",  "New Opp Owner ID",
 ]
 
