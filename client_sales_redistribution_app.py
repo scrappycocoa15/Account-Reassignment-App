@@ -1421,8 +1421,15 @@ def distribute(acct_df: pd.DataFrame,
     rep_names = [r["name"] for r in reps]
     rep_ids   = {r["name"]: r["id"] for r in reps}
 
-    arr_by_rep   = defaultdict(float)
-    count_by_rep = defaultdict(int)
+    arr_by_rep          = defaultdict(float)
+    count_by_rep        = defaultdict(int)
+    opp_forecast_by_rep = defaultdict(float)
+    opp_count_by_rep    = defaultdict(int)
+
+    # Weights for multi-objective customer scoring (must sum to 1.0)
+    _W_ARR          = 0.60
+    _W_OPP_FORECAST = 0.25
+    _W_OPP_COUNT    = 0.15
 
     # ── 1. Apply FY18 tag ─────────────────────────────────────────────────
     df = acct_df.copy()
@@ -1463,14 +1470,56 @@ def distribute(acct_df: pd.DataFrame,
     target_arr   = total_arr   / n if n else 1.0
     target_count = total_count / n if n else 1.0
 
+    # ── Pre-compute per-account opp forecast & count (customers only) ────────
+    # Used to factor opp load into the customer greedy scoring.
+    acct_opp_forecast: dict[str, float] = {}
+    acct_opp_count:    dict[str, int]   = {}
+    if opp_df is not None and len(opp_df) > 0:
+        _opp_id_col  = _find_col(opp_df, ["18 digit account id", "account id", "accountid"])
+        _opp_amt_col = _find_col(opp_df, ["forecast amount", "amount"])
+        _acct_id_col = _find_col(df,     ["18 digit account id", "account id", "id"])
+        if _opp_id_col and _acct_id_col:
+            for _, orow in opp_df.iterrows():
+                aid = str(orow.get(_opp_id_col, "") or "")
+                amt = parse_arr(orow.get(_opp_amt_col, 0) if _opp_amt_col else 0)
+                acct_opp_forecast[aid] = acct_opp_forecast.get(aid, 0.0) + amt
+                acct_opp_count[aid]    = acct_opp_count.get(aid, 0) + 1
+
+    # Totals across customer accounts only
+    _cust_id_col = _find_col(cust_df, ["18 digit account id", "account id", "id"])
+    total_opp_forecast = sum(
+        acct_opp_forecast.get(str(cust_df.at[i, _cust_id_col]), 0.0)
+        for i in cust_df.index if _cust_id_col
+    ) if _cust_id_col else 0.0
+    total_opp_count_cust = sum(
+        acct_opp_count.get(str(cust_df.at[i, _cust_id_col]), 0)
+        for i in cust_df.index if _cust_id_col
+    ) if _cust_id_col else 0
+
+    target_opp_forecast   = total_opp_forecast   / n if (n and total_opp_forecast)   else 1.0
+    target_opp_count_cust = total_opp_count_cust / n if (n and total_opp_count_cust) else 1.0
+
     assignments = {}
 
-    # Greedy by ARR for customers (only runs when ARR data is present)
+    # Greedy by combined score for customers:
+    #   60% ARR  +  25% opp forecast amount  +  15% opp count
     for idx, row in cust_df.iterrows():
         arr  = row.get("_arr", 0.0)
-        best = min(rep_names, key=lambda r: arr_by_rep[r] / target_arr)
+        acct_id = str(row.get(_cust_id_col, "")) if _cust_id_col else ""
+        opp_fc  = acct_opp_forecast.get(acct_id, 0.0)
+        opp_ct  = acct_opp_count.get(acct_id, 0)
+        best = min(
+            rep_names,
+            key=lambda r: (
+                _W_ARR          * (arr_by_rep[r]          / target_arr) +
+                _W_OPP_FORECAST * (opp_forecast_by_rep[r] / target_opp_forecast) +
+                _W_OPP_COUNT    * (opp_count_by_rep[r]    / target_opp_count_cust)
+            ),
+        )
         assignments[idx] = best
-        arr_by_rep[best] += arr
+        arr_by_rep[best]          += arr
+        opp_forecast_by_rep[best] += opp_fc
+        opp_count_by_rep[best]    += opp_ct
 
     # Greedy by count for non-customers (and customers when ARR unavailable)
     for idx, _ in other_df.iterrows():
