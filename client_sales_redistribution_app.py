@@ -1422,14 +1422,18 @@ def distribute(acct_df: pd.DataFrame,
     rep_ids   = {r["name"]: r["id"] for r in reps}
 
     arr_by_rep          = defaultdict(float)
-    count_by_rep        = defaultdict(int)
+    cust_count_by_rep   = defaultdict(int)   # customer accounts per rep
+    count_by_rep        = defaultdict(int)   # non-customer accounts per rep
     opp_forecast_by_rep = defaultdict(float)
     opp_count_by_rep    = defaultdict(int)
 
-    # Weights for multi-objective customer scoring (must sum to 1.0)
-    _W_ARR          = 0.60
-    _W_OPP_FORECAST = 0.25
-    _W_OPP_COUNT    = 0.15
+    # Weights for multi-objective customer scoring (must sum to 1.0).
+    # ARR is the primary axis; account count prevents a few large accounts
+    # from piling onto one rep while opp load adds secondary balance.
+    _W_ARR          = 0.50
+    _W_ACCT_COUNT   = 0.25
+    _W_OPP_FORECAST = 0.15
+    _W_OPP_COUNT    = 0.10
 
     # ── 1. Apply FY18 tag ─────────────────────────────────────────────────
     df = acct_df.copy()
@@ -1465,10 +1469,14 @@ def distribute(acct_df: pd.DataFrame,
         other_df = pd.concat([cust_df, other_df])
         cust_df  = cust_df.iloc[:0]   # empty
 
-    total_count  = len(other_df)
-    n            = len(rep_names)
-    target_arr   = total_arr   / n if n else 1.0
-    target_count = total_count / n if n else 1.0
+    total_count      = len(other_df)
+    total_cust_count = len(cust_df)
+    total_all        = len(df)
+    n                = len(rep_names)
+    target_arr        = total_arr        / n if n else 1.0
+    target_cust_count = total_cust_count / n if n else 1.0
+    target_count      = total_count      / n if n else 1.0
+    target_all        = total_all        / n if n else 1.0
 
     # ── Pre-compute per-account opp forecast & count (customers only) ────────
     # Used to factor opp load into the customer greedy scoring.
@@ -1501,29 +1509,36 @@ def distribute(acct_df: pd.DataFrame,
 
     assignments = {}
 
-    # Greedy by combined score for customers:
-    #   60% ARR  +  25% opp forecast amount  +  15% opp count
+    # ── Customer greedy: ARR + account count + opp forecast + opp count ──────
+    # Sorting by ARR desc first gives the greedy the best chance to spread
+    # high-value accounts before filling in smaller ones.
     for idx, row in cust_df.iterrows():
-        arr  = row.get("_arr", 0.0)
+        arr     = row.get("_arr", 0.0)
         acct_id = str(row.get(_cust_id_col, "")) if _cust_id_col else ""
         opp_fc  = acct_opp_forecast.get(acct_id, 0.0)
         opp_ct  = acct_opp_count.get(acct_id, 0)
         best = min(
             rep_names,
             key=lambda r: (
-                _W_ARR          * (arr_by_rep[r]          / target_arr) +
+                _W_ARR        * (arr_by_rep[r]          / target_arr) +
+                _W_ACCT_COUNT * (cust_count_by_rep[r]   / (target_cust_count or 1.0)) +
                 _W_OPP_FORECAST * (opp_forecast_by_rep[r] / target_opp_forecast) +
                 _W_OPP_COUNT    * (opp_count_by_rep[r]    / target_opp_count_cust)
             ),
         )
         assignments[idx] = best
         arr_by_rep[best]          += arr
+        cust_count_by_rep[best]   += 1
         opp_forecast_by_rep[best] += opp_fc
         opp_count_by_rep[best]    += opp_ct
 
-    # Greedy by count for non-customers (and customers when ARR unavailable)
+    # ── Non-customer greedy: balance TOTAL accounts (customers + non-customers)
+    # This compensates for any count skew introduced by the customer pass above.
     for idx, _ in other_df.iterrows():
-        best = min(rep_names, key=lambda r: count_by_rep[r] / target_count if target_count else 0)
+        best = min(
+            rep_names,
+            key=lambda r: (cust_count_by_rep[r] + count_by_rep[r]) / target_all,
+        )
         assignments[idx] = best
         count_by_rep[best] += 1
 
