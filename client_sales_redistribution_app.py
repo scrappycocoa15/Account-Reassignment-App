@@ -150,15 +150,18 @@ footer { visibility: hidden; }
 # SESSION STATE INITIALISATION
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULTS = {
+    # ── shared ────────────────────────────────────────────────────────────────
+    "mode":             "distribute",   # "distribute" | "return"
     "connected":        False,
     "conn_msg":         "",
+    "sender_name":      "",
+    # ── distribute mode ───────────────────────────────────────────────────────
     "roster_df":        None,
     "acct_df":          None,
     "opp_df":           None,
     "departing_name":   "",
     "departing_id":     "",
     "tag_name":         "",
-    "sender_name":      "",
     "receiving_reps":   [],    # list of {"name": .., "id": ..}
     "include_opps":     False,
     "result_full":      None,  # bytes
@@ -168,6 +171,19 @@ _DEFAULTS = {
     "dropped_acct":     [],
     "dropped_opp":      [],
     "dist_summary":     None,  # DataFrame
+    # ── return mode ───────────────────────────────────────────────────────────
+    "ret_rep_name":     "",
+    "ret_rep_id":       "",
+    "ret_tag_string":   "",    # exact string to match in Prev Acct Owner tag
+    "ret_manager":      "",    # optional manager filter
+    "ret_acct_df":      None,
+    "ret_opp_df":       None,
+    "ret_include_opps": False,
+    "ret_run_done":     False,
+    "ret_result_full":  None,
+    "ret_result_fs":    None,
+    "ret_result_filename": "",
+    "ret_summary":      None,
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -176,6 +192,11 @@ for k, v in _DEFAULTS.items():
 def reset_results():
     for k in ("result_full", "result_fs", "result_filename", "run_done",
               "dist_summary"):
+        st.session_state[k] = _DEFAULTS[k]
+
+def reset_ret_results():
+    for k in ("ret_result_full", "ret_result_fs", "ret_result_filename",
+              "ret_run_done", "ret_summary"):
         st.session_state[k] = _DEFAULTS[k]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -816,6 +837,171 @@ def fetch_opps_soql(sid: str, owner_id: str,
     return rows, []
 
 
+# ── Return-flow: fetch accounts by FY18 Prev Acct Owner tag ──────────────────
+
+def fetch_accounts_by_tag(sid: str, tag_string: str,
+                          manager_filter: str = "",
+                          arr_field_override: str = "",
+                          fy18_field_override: str = "",
+                          status_fn=None) -> tuple:
+    """
+    Fetch all Account records whose FY18 Sales Planning field contains
+    'Prev Acct Owner: <tag_string>' (case-insensitive LIKE match).
+
+    Optionally narrows results to accounts currently owned by reps who
+    report to manager_filter (partial name match on Owner.Manager.Name).
+
+    Returns (list_of_row_dicts, fy18_api_name, warnings).
+    """
+    warnings_out = []
+
+    # ── Discover field API names ────────────────────────────────────────────
+    if status_fn:
+        status_fn("Discovering ARR and FY18 field API names…")
+    arr_label, arr_api, fy18_label, fy18_api = _discover_account_fields(
+        sid, owner_id=None, status_fn=status_fn
+    )
+    if arr_field_override and arr_field_override.strip():
+        arr_api = arr_field_override.strip()
+    if fy18_field_override and fy18_field_override.strip():
+        fy18_api = fy18_field_override.strip()
+
+    if not fy18_api:
+        raise ValueError(
+            "Could not auto-discover the FY18 Sales Planning field. "
+            "Enter its API name in the sidebar 'FY18 field API name' box."
+        )
+
+    # ── Build SOQL ──────────────────────────────────────────────────────────
+    safe_tag = tag_string.replace("'", "\\'")
+    select_parts = [
+        "Id", "Name", "OwnerId", "Owner.Name", "Owner.Manager.Name",
+        "Type", "Rating", "LastActivityDate",
+    ]
+    if arr_api:
+        select_parts.append(arr_api)
+    select_parts.append(fy18_api)
+
+    where = f"{fy18_api} LIKE '%Prev Acct Owner: {safe_tag}%'"
+    if manager_filter and manager_filter.strip():
+        safe_mgr = manager_filter.strip().replace("'", "\\'")
+        where += f" AND Owner.Manager.Name LIKE '%{safe_mgr}%'"
+
+    soql = f"SELECT {', '.join(select_parts)} FROM Account WHERE {where}"
+
+    if status_fn:
+        status_fn(f"Querying accounts with tag 'Prev Acct Owner: {tag_string}'…")
+    records = _soql_query_all(sid, soql, status_fn=status_fn)
+
+    rows = []
+    for rec in records:
+        owner = rec.get("Owner") or {}
+        mgr   = owner.get("Manager") or {}
+        row   = {
+            "18 Digit Account ID": rec.get("Id", ""),
+            "Account Name":        rec.get("Name", ""),
+            "Account Owner":       owner.get("Name", ""),
+            "Account Owner ID":    rec.get("OwnerId", ""),
+            "Manager":             mgr.get("Name", ""),
+            "Account Type":        rec.get("Type",   "") or "",
+            "Rating":              rec.get("Rating", "") or "",
+            "Last Activity":       str(rec.get("LastActivityDate") or ""),
+        }
+        if arr_api:
+            val = rec.get(arr_api)
+            try:
+                row["Contractual ARR (converted)"] = (
+                    f"USD {float(val):,.2f}" if val is not None else ""
+                )
+            except (TypeError, ValueError):
+                row["Contractual ARR (converted)"] = str(val) if val is not None else ""
+        row["FY18 Sales Planning"] = str(rec.get(fy18_api) or "")
+        rows.append(row)
+
+    if not arr_api:
+        warnings_out.append("No ARR field found — ARR will show as blank.")
+    if status_fn:
+        status_fn(f"Done — {len(rows):,} accounts found.")
+    return rows, fy18_api, warnings_out
+
+
+def fetch_opps_by_account_ids(sid: str, account_ids: list,
+                               amount_field_override: str = "",
+                               status_fn=None) -> tuple:
+    """
+    Fetch all open Opportunities whose AccountId is in account_ids.
+    Batches into groups of 500 to stay within SOQL IN-clause limits.
+    Returns (rows_as_list_of_dicts, warnings).
+    """
+    if not account_ids:
+        return [], []
+
+    # ── Discover amount field (reuse opp describe logic) ────────────────────
+    amt_api = amount_field_override.strip() if amount_field_override else None
+    if not amt_api:
+        try:
+            _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
+                    f"/sobjects/Opportunity/describe")
+            _r = requests.get(_url, headers=sf_headers(sid), timeout=30)
+            _r.raise_for_status()
+            opp_fields = _r.json().get("fields", [])
+            by_lbl = {f["label"].lower(): f for f in opp_fields}
+            for lbl in ["forecast amount", "amount"]:
+                if lbl in by_lbl:
+                    amt_api = by_lbl[lbl]["name"]
+                    break
+            if not amt_api:
+                amt_api = "Amount"
+        except Exception:
+            amt_api = "Amount"
+
+    extra_field = f", {amt_api}" if amt_api and amt_api != "Amount" else ""
+    BATCH = 500
+    all_rows = []
+
+    for i in range(0, len(account_ids), BATCH):
+        batch   = account_ids[i : i + BATCH]
+        id_list = "', '".join(batch)
+        soql    = (
+            f"SELECT Id, Name, AccountId, Account.Name, Type, "
+            f"CreatedDate, LeadSource, Amount{extra_field}, CloseDate, "
+            f"StageName, Owner.Name, OwnerId "
+            f"FROM Opportunity "
+            f"WHERE IsClosed = false AND AccountId IN ('{id_list}')"
+        )
+        if status_fn:
+            status_fn(f"Fetching opps batch {i//BATCH + 1}…")
+        records = _soql_query_all(sid, soql, status_fn=status_fn)
+
+        for rec in records:
+            acct  = rec.get("Account") or {}
+            owner = rec.get("Owner")   or {}
+            raw_amt = rec.get(amt_api) if amt_api else None
+            if raw_amt is None:
+                raw_amt = rec.get("Amount")
+            try:
+                amt_str = f"USD {float(raw_amt):,.2f}" if raw_amt is not None else ""
+            except (TypeError, ValueError):
+                amt_str = str(raw_amt) if raw_amt is not None else ""
+            all_rows.append({
+                "ID (18 Char)":        rec.get("Id", ""),
+                "Opportunity Name":    rec.get("Name", ""),
+                "18 Digit Account ID": rec.get("AccountId", ""),
+                "Account Name":        acct.get("Name", ""),
+                "Type":                rec.get("Type", "") or "",
+                "Created Date":        str(rec.get("CreatedDate") or ""),
+                "Lead Source":         rec.get("LeadSource", "") or "",
+                "Forecast Amount":     amt_str,
+                "Close Date":          str(rec.get("CloseDate") or ""),
+                "Stage":               rec.get("StageName", "") or "",
+                "Opportunity Owner":   owner.get("Name", ""),
+            })
+
+    if status_fn:
+        status_fn(f"Done — {len(all_rows):,} open opportunities found.")
+    return all_rows, []
+
+
 # ── Analytics API (kept as reference / fallback) ──────────────────────────────
 
 def _describe_report(sid: str, report_id: str) -> dict:
@@ -1393,6 +1579,23 @@ def apply_fy18_tag(val, tag: str) -> str:
     # Rule 3 — has other content, append
     return f"{s}, Prev Acct Owner: {tag}"
 
+
+def clear_fy18_prev_tag(val) -> str:
+    """
+    Remove ALL 'Prev Acct Owner: ...' and 'Prev Account Owner: ...' segments
+    from the FY18 Sales Planning field, preserving all other tags.
+    Handles stacked tags (no comma separator between them) cleanly.
+    """
+    if pd.isna(val):
+        return val
+    cleaned = re.sub(
+        r',?\s*Prev Acct(?:ount)? Owner:[^,;]+',
+        '', str(val), flags=re.IGNORECASE
+    )
+    cleaned = re.sub(r'^[\s,;]+|[\s,;]+$', '', cleaned)
+    cleaned = re.sub(r',\s*,', ',', cleaned)
+    return cleaned.strip()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DISTRIBUTION LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1621,6 +1824,57 @@ def distribute(acct_df: pd.DataFrame,
 
     return df, opp_out, summary_df
 
+
+def reassign(acct_df: pd.DataFrame,
+             opp_df: pd.DataFrame | None,
+             rep_name: str,
+             rep_id: str,
+             fy18_col: str | None,
+             arr_col: str | None) -> tuple:
+    """
+    Return-flow engine: assign every account to a single rep and clear the
+    Prev Acct Owner tag from the FY18 Sales Planning field.
+
+    Returns (acct_out, opp_out, summary_df).
+    """
+    df = acct_df.copy()
+
+    # Preserve original owner for FS reference
+    if "Account Owner" in df.columns:
+        df.insert(df.columns.get_loc("Account Owner"), "Original Account Owner",
+                  df["Account Owner"])
+
+    df["New Account Owner Name"] = rep_name
+    df["New Account Owner ID"]   = rep_id
+
+    # Clear the Prev Acct Owner tag; preserve all other FY18 content
+    if fy18_col and fy18_col in df.columns:
+        df[fy18_col] = df[fy18_col].apply(clear_fy18_prev_tag)
+
+    df = _insert_after(df, "Account Owner",
+                       ["New Account Owner Name", "New Account Owner ID"])
+
+    # Align opps to the returning rep
+    opp_out = None
+    if opp_df is not None and len(opp_df) > 0:
+        opp_out = opp_df.copy()
+        opp_out["New Opp Owner Name"] = rep_name
+        opp_out["New Opp Owner ID"]   = rep_id
+        opp_out = _insert_after(opp_out, "Opportunity Owner",
+                                ["New Opp Owner Name", "New Opp Owner ID"])
+
+    arr_v = (df[arr_col].apply(parse_arr).sum()
+             if arr_col and arr_col in df.columns else 0.0)
+    summary_df = pd.DataFrame([{
+        "Rep Name":          rep_name,
+        "Owner ID":          rep_id,
+        "Accounts Assigned": len(df),
+        "Account ARR":       round(arr_v, 2),
+        "Opps Assigned":     len(opp_out) if opp_out is not None else 0,
+    }])
+    return df, opp_out, summary_df
+
+
 def _insert_after(df: pd.DataFrame, after_col: str,
                   new_cols: list[str]) -> pd.DataFrame:
     """Insert new_cols immediately after after_col (if present)."""
@@ -1822,6 +2076,32 @@ def compose_mailto(departing_name: str, n_accts: int,
             f"?subject={urllib.parse.quote(subject)}"
             f"&body={urllib.parse.quote(body)}")
 
+
+def compose_mailto_return(rep_name: str, n_accts: int,
+                          n_opps: int, include_opps: bool,
+                          filename: str,
+                          sender_name: str = "") -> str:
+    """Build a mailto: URI for the return-territory Field Services email."""
+    subject = f"Territory Return — {rep_name}"
+    actions = [
+        f"Reassign the {n_accts:,} accounts back to {rep_name}",
+        "Update the FY18 Sales Planning field (Prev Acct Owner tag removed)",
+    ]
+    if include_opps and n_opps > 0:
+        actions.append(f"Reassign the {n_opps:,} open opportunities back to {rep_name}")
+    numbered = "\n".join(f"{i + 1}. {a}" for i, a in enumerate(actions))
+    sig = sender_name.strip() if sender_name.strip() else "[Your name]"
+    body = (
+        "Hi team,\n\n"
+        "Please make the following updates using the attached file:\n"
+        f"{numbered}\n\n"
+        "Thanks,\n"
+        f"{sig}"
+    )
+    return (f"mailto:{FS_EMAIL}"
+            f"?subject={urllib.parse.quote(subject)}"
+            f"&body={urllib.parse.quote(body)}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # UI HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1896,6 +2176,12 @@ def main():
             value="",
             placeholder="e.g. Contractual_ARR_USD__c",
             help="Paste the API Name from the scanner below if auto-discovery fails."
+        )
+        fy18_field_override = st.text_input(
+            "FY18 field API name",
+            value="",
+            placeholder="e.g. FY18_Sales_Planning__c",
+            help="Override FY18 Sales Planning field API name if auto-discovery fails."
         )
 
         if st.button("Scan Account fields", use_container_width=True,
@@ -2060,487 +2346,874 @@ def main():
             unsafe_allow_html=True
         )
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 1 — Departing Rep
-    # ═══════════════════════════════════════════════════════════════════════
-    step1_done = bool(st.session_state.departing_name and
-                      st.session_state.departing_id)
+    # ── Mode toggle (placed after sidebar so `sid` is already bound) ─────────
+    mode_col, _ = st.columns([3, 5])
+    with mode_col:
+        mode_label = st.radio(
+            "Mode",
+            ["Distribute Territory", "Return Territory"],
+            index=0 if st.session_state.mode == "distribute" else 1,
+            horizontal=True,
+            help=(
+                "**Distribute Territory** — spread a departing/leaving rep's "
+                "accounts across their team and tag with Prev Acct Owner.\n\n"
+                "**Return Territory** — pull accounts back to a returning or "
+                "newly hired rep by matching the Prev Acct Owner tag, and "
+                "clear the tag."
+            ),
+        )
+    new_mode = "distribute" if mode_label == "Distribute Territory" else "return"
+    if new_mode != st.session_state.mode:
+        st.session_state.mode = new_mode
+        st.rerun()
 
-    with st.expander("Step 1 — Departing Rep", expanded=not step1_done):
-        c1, c2, c3 = st.columns([3, 3, 2])
-        with c1:
-            dep_name = st.text_input(
-                "Full name", value=st.session_state.departing_name,
-                placeholder="e.g. Sydney Clawson"
-            )
-        with c2:
-            dep_id = st.text_input(
-                "Salesforce User ID (18-char)",
-                value=st.session_state.departing_id,
-                placeholder="0057V000…"
-            )
-        with c3:
-            tag_suffix = st.text_input(
-                "FY18 tag suffix (optional)",
-                value="",
-                placeholder='e.g. "26" → Sydney Clawson 26',
-                help='Appended after the name in the Prev Acct Owner tag. '
-                     'Leave blank for no suffix.'
-            )
-
-        # Live SFDC lookup
-        if st.session_state.connected and dep_name and not dep_id:
-            results = lookup_user_sfdc(sid, dep_name)
-            if results:
-                options = {f"{r['Name']} ({r['Id']})": r for r in results}
-                choice  = st.selectbox("Select rep from Salesforce", list(options))
-                if st.button("Use this rep"):
-                    picked = options[choice]
-                    st.session_state.departing_name = picked["Name"]
-                    st.session_state.departing_id   = picked["Id"]
-                    sfx = f" {tag_suffix.strip()}" if tag_suffix.strip() else ""
-                    st.session_state.tag_name = picked["Name"] + sfx
-                    reset_results()
-                    st.rerun()
-
-        if st.button("Confirm Rep", key="confirm_rep"):
-            if dep_name and dep_id:
-                st.session_state.departing_name = dep_name.strip()
-                st.session_state.departing_id   = dep_id.strip()
-                sfx = f" {tag_suffix.strip()}" if tag_suffix.strip() else ""
-                st.session_state.tag_name = dep_name.strip() + sfx
-                reset_results()
-                _ok(f"Departing rep set: {dep_name} | FY18 tag: "
-                    f"Prev Acct Owner: {st.session_state.tag_name}")
-            else:
-                _warn("Please enter both the rep name and Salesforce User ID.")
-
-    if step1_done:
-        _ok(f"Departing rep: **{st.session_state.departing_name}** "
-            f"| FY18 tag: *Prev Acct Owner: {st.session_state.tag_name}*")
+    st.divider()
 
     # ═══════════════════════════════════════════════════════════════════════
-    # STEP 2 — Load Account Data
+    # RETURN TERRITORY FLOW
     # ═══════════════════════════════════════════════════════════════════════
-    step2_done = st.session_state.acct_df is not None
-    with st.expander("Step 2 — Account Data", expanded=step1_done and not step2_done):
-        if not step1_done:
-            _info("Complete Step 1 first.")
-        else:
-            src = st.radio("Data source", ["Upload file", "Fetch from Salesforce"],
-                           horizontal=True, key="acct_src")
-            if src == "Upload file":
-                f = st.file_uploader("Account file (XLS, XLSX, CSV)",
-                                     type=["xls", "xlsx", "csv"], key="acct_upload")
-                if f and st.button("Load accounts"):
-                    try:
-                        df = parse_uploaded_file(f)
-                        # Filter to departing rep if Account Owner column exists
-                        oc = _find_col(df, ["account owner"])
-                        if oc:
-                            before = len(df)
-                            df = df[df[oc].str.strip() == st.session_state.departing_name]
-                            df = df.reset_index(drop=True)
-                            if len(df) == 0:
-                                _warn(f"No rows matched owner '{st.session_state.departing_name}'. "
-                                      "Loaded all rows instead.")
-                                df = parse_uploaded_file(f)
-                        st.session_state.acct_df = df
-                        reset_results()
+    if st.session_state.mode == "return":
+
+        # ── Step R1 — Returning / Incoming Rep ──────────────────────────────
+        ret_step1_done = bool(st.session_state.ret_rep_name and
+                              st.session_state.ret_rep_id and
+                              st.session_state.ret_tag_string)
+
+        with st.expander("Step 1 — Returning / Incoming Rep",
+                         expanded=not ret_step1_done):
+            c1, c2 = st.columns(2)
+            with c1:
+                ret_name = st.text_input(
+                    "Full name",
+                    value=st.session_state.ret_rep_name,
+                    placeholder="e.g. Jordan Breisacher",
+                    key="ret_name_input",
+                )
+            with c2:
+                ret_id = st.text_input(
+                    "Salesforce User ID (18-char)",
+                    value=st.session_state.ret_rep_id,
+                    placeholder="0057V000…",
+                    key="ret_id_input",
+                    help="For a new hire taking over the territory, enter their "
+                         "SFDC User ID here.",
+                )
+
+            c3, c4 = st.columns(2)
+            with c3:
+                ret_tag = st.text_input(
+                    "Tag string to match",
+                    value=st.session_state.ret_tag_string or ret_name,
+                    placeholder="e.g. Jordan Breisacher  or  Kaitlin Dailey 25",
+                    key="ret_tag_input",
+                    help="Exact string that appears after 'Prev Acct Owner:' in the "
+                         "FY18 field. Defaults to the name above — override if a "
+                         "year suffix was appended when accounts were distributed.",
+                )
+            with c4:
+                ret_mgr = st.text_input(
+                    "Manager filter (optional)",
+                    value=st.session_state.ret_manager,
+                    placeholder="e.g. Jake Rutenbar",
+                    key="ret_mgr_input",
+                    help="Narrows results to accounts currently held by reps who "
+                         "report to this manager. Leave blank to pull all matching "
+                         "accounts regardless of current manager.",
+                )
+
+            # Live SFDC lookup
+            if st.session_state.connected and ret_name and not ret_id:
+                results = lookup_user_sfdc(sid, ret_name)
+                if results:
+                    options = {f"{r['Name']} ({r['Id']})": r for r in results}
+                    choice  = st.selectbox("Select rep from Salesforce",
+                                           list(options), key="ret_sfdc_sel")
+                    if st.button("Use this rep", key="ret_use_rep"):
+                        picked = options[choice]
+                        st.session_state.ret_rep_name   = picked["Name"]
+                        st.session_state.ret_rep_id     = picked["Id"]
+                        st.session_state.ret_tag_string = picked["Name"]
+                        reset_ret_results()
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not parse file: {e}")
 
-            else:  # Fetch from Salesforce
+            if st.button("Confirm Rep", key="ret_confirm_rep"):
+                if ret_name and ret_id and ret_tag:
+                    st.session_state.ret_rep_name   = ret_name.strip()
+                    st.session_state.ret_rep_id     = ret_id.strip()
+                    st.session_state.ret_tag_string = ret_tag.strip()
+                    st.session_state.ret_manager    = ret_mgr.strip()
+                    reset_ret_results()
+                    _ok(f"Rep set: **{ret_name}** | Matching tag: "
+                        f"*Prev Acct Owner: {ret_tag}*"
+                        + (f" | Manager filter: *{ret_mgr}*" if ret_mgr else ""))
+                else:
+                    _warn("Please enter name, Salesforce User ID, and tag string.")
+
+        if ret_step1_done:
+            _ok(
+                f"Rep: **{st.session_state.ret_rep_name}** &nbsp;|&nbsp; "
+                f"Tag match: *Prev Acct Owner: {st.session_state.ret_tag_string}*"
+                + (f" &nbsp;|&nbsp; Manager: *{st.session_state.ret_manager}*"
+                   if st.session_state.ret_manager else "")
+            )
+
+        # ── Step R2 — Fetch Accounts ─────────────────────────────────────────
+        ret_step2_done = st.session_state.ret_acct_df is not None
+
+        with st.expander("Step 2 — Account Data",
+                         expanded=ret_step1_done and not ret_step2_done):
+            if not ret_step1_done:
+                _info("Complete Step 1 first.")
+            else:
+                _info(
+                    "Queries Salesforce for all accounts whose <strong>FY18 Sales "
+                    "Planning</strong> field contains "
+                    f"<strong>Prev Acct Owner: "
+                    f"{st.session_state.ret_tag_string}</strong>."
+                    + (f" Filtered to accounts currently held by reps under "
+                       f"<strong>{st.session_state.ret_manager}</strong>."
+                       if st.session_state.ret_manager else "")
+                )
                 if not st.session_state.connected:
                     _warn("Connect to Salesforce first (sidebar).")
-                else:
-                    if not st.session_state.departing_id:
-                        _warn("Enter the departing rep's Salesforce User ID in Step 1.")
-                    else:
-                        _info(
-                            f"Queries Salesforce directly via SOQL — all accounts "
-                            f"owned by <strong>{st.session_state.departing_name}</strong> "
-                            f"({st.session_state.departing_id}). "
-                            f"No row-count limit. Custom fields auto-discovered."
-                        )
-                        if st.button("Fetch accounts from Salesforce"):
-                            with st.spinner("Querying accounts…"):
-                                try:
-                                    msgs = []
-                                    rows, warns = fetch_accounts_soql(
-                                        sid,
-                                        owner_id=st.session_state.departing_id,
-                                        arr_field_override=arr_field_override,
-                                        status_fn=lambda m: msgs.append(m)
-                                    )
-                                    df = pd.DataFrame(rows).fillna("")
-                                    st.session_state.acct_df      = df
-                                    st.session_state.dropped_acct = warns
-                                    st.session_state.fetch_msgs   = msgs
-                                    reset_results()
-                                    for w in warns:
-                                        _warn(w)
-                                    if msgs:
-                                        with st.expander("Fetch details",
-                                                         expanded=True):
-                                            for m in msgs:
-                                                st.caption(m)
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Account fetch failed: {e}")
-
-    if step2_done:
-        df = st.session_state.acct_df
-        arr_col  = detect_arr_col(df)
-        fy18_col = detect_fy18_col(df)
-        type_col = _find_col(df, ["account type", "type"])
-        n_cust   = int(df[type_col].apply(_is_customer).sum()) if type_col else 0
-        n_other  = len(df) - n_cust
-        total_arr = df[arr_col].apply(parse_arr).sum() if arr_col else 0.0
-
-        _metrics_row(
-            _metric("Accounts", len(df)),
-            _metric("Customers", n_cust, green=True),
-            _metric("Non-Customers", n_other),
-            _metric("Total ARR", f"${total_arr:,.0f}") if arr_col else _metric("ARR col", "Not found"),
-        )
-        if not arr_col:
-            _warn("No ARR column detected — customers will be distributed by count only.")
-        if not fy18_col:
-            _warn("No FY18 Sales Planning column detected — tagging will be skipped.")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 3 — Receiving Team
-    # ═══════════════════════════════════════════════════════════════════════
-    step3_done = len(st.session_state.receiving_reps) > 0
-    with st.expander("Step 3 — Receiving Team", expanded=step2_done and not step3_done):
-        if not step2_done:
-            _info("Complete Step 2 first.")
-        else:
-            # ── Roster source ─────────────────────────────────────────────
-            st.markdown('<div class="section-title">Roster</div>',
-                        unsafe_allow_html=True)
-            _info(
-                f"Built-in roster: **Global SMB Roster ({ROSTER_AS_OF})** — "
-                f"{len(_EMBEDDED_ROSTER_DF)} reps across "
-                f"{_EMBEDDED_ROSTER_DF['division'].nunique()} divisions.  "
-                "Upload a newer file below to override."
-            )
-            roster_file = st.file_uploader(
-                "Upload updated roster (XLS, XLSX, CSV) — optional",
-                type=["xls", "xlsx", "csv"], key="roster_upload"
-            )
-            if roster_file:
-                try:
-                    raw    = parse_uploaded_file(roster_file)
-                    parsed = parse_roster(raw)
-                    st.session_state.roster_df = parsed
-                    _ok(f"Uploaded roster loaded: {len(parsed)} reps.")
-                except Exception as e:
-                    st.error(f"Could not parse roster: {e}")
-                    st.session_state.roster_df = None
-
-            # Use uploaded override if available, otherwise fall back to embedded
-            roster: pd.DataFrame = (
-                st.session_state.roster_df
-                if st.session_state.roster_df is not None
-                else get_embedded_roster()
-            )
-
-            # ── Division filter ───────────────────────────────────────────
-            st.markdown('<div class="section-title">Filter Roster</div>',
-                        unsafe_allow_html=True)
-            divisions = sorted(roster["division"].dropna().unique().tolist())
-            divisions = [d for d in divisions if d not in ("", "nan")]
-            all_div_label = "— All Divisions —"
-            div_options   = [all_div_label] + divisions
-
-            selected_division = st.selectbox(
-                "Division", div_options, key="division_sel"
-            )
-            if selected_division == all_div_label:
-                div_filtered = roster
-            else:
-                div_filtered = roster[roster["division"] == selected_division]
-
-            # ── Leader filter (scoped to chosen division) ─────────────────
-            leaders = sorted(div_filtered["manager"].dropna().unique().tolist())
-            leaders = [l for l in leaders if l not in ("", "nan")]
-            all_mgr_label  = "— All Leaders —"
-            leader_options = [all_mgr_label] + leaders
-
-            selected_leader = st.selectbox(
-                "Leader / Manager", leader_options, key="leader_sel"
-            )
-            if selected_leader == all_mgr_label:
-                filtered = div_filtered
-            else:
-                filtered = div_filtered[div_filtered["manager"] == selected_leader]
-
-            # Exclude the departing rep from the receiving list
-            filtered = filtered[
-                filtered["rep_name"] != st.session_state.departing_name
-            ].reset_index(drop=True)
-
-            if len(filtered) == 0:
-                _warn("No eligible reps found after filtering.")
-            else:
-                st.markdown(
-                    f'<div class="section-title">'
-                    f'Select Receiving Reps ({len(filtered)} eligible)</div>',
-                    unsafe_allow_html=True
-                )
-                selected = []
-                cols_per_row = 2
-                rows_needed  = math.ceil(len(filtered) / cols_per_row)
-                for row_i in range(rows_needed):
-                    row_cols = st.columns(cols_per_row)
-                    for ci in range(cols_per_row):
-                        idx = row_i * cols_per_row + ci
-                        if idx >= len(filtered):
-                            break
-                        rep   = filtered.iloc[idx]
-                        label = (
-                            rep["rep_name"]
-                            + (f"  ·  {rep['region']}" if rep.get("region") else "")
-                        )
-                        if row_cols[ci].checkbox(label, value=True,
-                                                 key=f"rep_{rep['rep_id']}"):
-                            selected.append({"name": rep["rep_name"],
-                                             "id":   rep["rep_id"]})
-
-                if st.button("Confirm Team", key="confirm_team"):
-                    if len(selected) < 1:
-                        _warn("Select at least one receiving rep.")
-                    else:
-                        st.session_state.receiving_reps = selected
-                        reset_results()
-                        _ok(f"{len(selected)} reps confirmed.")
-                        st.rerun()
-
-    if step3_done:
-        names = [r["name"] for r in st.session_state.receiving_reps]
-        _ok(f"Receiving team ({len(names)}): " + " · ".join(names))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 4 — Open Pipeline (optional)
-    # ═══════════════════════════════════════════════════════════════════════
-    with st.expander("Step 4 — Open Pipeline (optional)",
-                     expanded=step3_done and not st.session_state.run_done):
-        if not step3_done:
-            _info("Complete Step 3 first.")
-        else:
-            include = st.checkbox(
-                "Include open opportunities in this redistribution",
-                value=st.session_state.include_opps,
-                key="include_opps_cb"
-            )
-            st.session_state.include_opps = include
-
-            if include:
-                src2 = st.radio("Opp data source",
-                                ["Upload file", "Fetch from Salesforce"],
-                                horizontal=True, key="opp_src")
-                if src2 == "Upload file":
-                    f2 = st.file_uploader("Open pipeline file (XLS, XLSX, CSV)",
-                                          type=["xls", "xlsx", "csv"],
-                                          key="opp_upload")
-                    if f2 and st.button("Load opps"):
+                elif st.button("Fetch accounts from Salesforce",
+                               key="ret_fetch_accts"):
+                    with st.spinner("Querying accounts…"):
                         try:
-                            st.session_state.opp_df = parse_uploaded_file(f2)
-                            reset_results()
-                            st.rerun()
+                            msgs = []
+                            rows, _fy18_api, warns = fetch_accounts_by_tag(
+                                sid,
+                                tag_string=st.session_state.ret_tag_string,
+                                manager_filter=st.session_state.ret_manager,
+                                arr_field_override=arr_field_override,
+                                fy18_field_override=fy18_field_override,
+                                status_fn=lambda m: msgs.append(m),
+                            )
+                            if not rows:
+                                _warn(
+                                    f"No accounts found with tag "
+                                    f"'Prev Acct Owner: "
+                                    f"{st.session_state.ret_tag_string}'. "
+                                    "Check the tag string or manager filter."
+                                )
+                            else:
+                                df = pd.DataFrame(rows).fillna("")
+                                st.session_state.ret_acct_df = df
+                                reset_ret_results()
+                                for w in warns:
+                                    _warn(w)
+                                if msgs:
+                                    with st.expander("Fetch details",
+                                                     expanded=False):
+                                        for m in msgs:
+                                            st.caption(m)
+                                st.rerun()
+                        except ValueError as ve:
+                            st.error(str(ve))
                         except Exception as e:
-                            st.error(f"Could not parse file: {e}")
-                else:
+                            st.error(f"Account fetch failed: {e}")
+
+        if ret_step2_done:
+            df = st.session_state.ret_acct_df
+            arr_col_r  = detect_arr_col(df)
+            type_col_r = _find_col(df, ["account type", "type"])
+            n_cust_r   = int(df[type_col_r].apply(_is_customer).sum()) if type_col_r else 0
+            n_other_r  = len(df) - n_cust_r
+            total_arr_r = df[arr_col_r].apply(parse_arr).sum() if arr_col_r else 0.0
+            _metrics_row(
+                _metric("Accounts", len(df)),
+                _metric("Customers", n_cust_r, green=True),
+                _metric("Non-Customers", n_other_r),
+                _metric("Total ARR", f"${total_arr_r:,.0f}")
+                if arr_col_r else _metric("ARR col", "Not found"),
+            )
+
+        # ── Step R3 — Open Pipeline (optional) ──────────────────────────────
+        with st.expander("Step 3 — Open Pipeline (optional)",
+                         expanded=ret_step2_done and not st.session_state.ret_run_done):
+            if not ret_step2_done:
+                _info("Complete Step 2 first.")
+            else:
+                include_r = st.checkbox(
+                    "Include open opportunities in this return",
+                    value=st.session_state.ret_include_opps,
+                    key="ret_include_opps_cb",
+                )
+                st.session_state.ret_include_opps = include_r
+
+                if include_r:
                     if not st.session_state.connected:
                         _warn("Connect to Salesforce first (sidebar).")
                     else:
                         _info(
-                            f"Queries Salesforce directly via SOQL — all open "
-                            f"opportunities owned by "
-                            f"<strong>{st.session_state.departing_name}</strong>."
+                            "Fetches all open opportunities linked to the matched "
+                            "accounts, regardless of current opp owner."
                         )
-                        if st.button("Fetch opps from Salesforce"):
-                            with st.spinner("Querying open opportunities…"):
+                        if st.button("Fetch open opps from Salesforce",
+                                     key="ret_fetch_opps"):
+                            with st.spinner("Querying opportunities…"):
                                 try:
-                                    msgs2 = []
-                                    rows, warns = fetch_opps_soql(
-                                        sid,
-                                        owner_id=st.session_state.departing_id,
-                                        amount_field_override=opp_amount_override,
-                                        status_fn=lambda m: msgs2.append(m)
+                                    id_col_r = _find_col(
+                                        st.session_state.ret_acct_df,
+                                        ["18 digit account id", "id"]
                                     )
-                                    st.session_state.opp_df      = pd.DataFrame(rows).fillna("")
-                                    st.session_state.dropped_opp = warns
-                                    reset_results()
-                                    for w in warns:
+                                    acct_ids = (
+                                        st.session_state.ret_acct_df[id_col_r]
+                                        .astype(str).tolist()
+                                        if id_col_r else []
+                                    )
+                                    msgs2 = []
+                                    rows2, warns2 = fetch_opps_by_account_ids(
+                                        sid, acct_ids,
+                                        status_fn=lambda m: msgs2.append(m),
+                                    )
+                                    st.session_state.ret_opp_df = (
+                                        pd.DataFrame(rows2).fillna("")
+                                        if rows2 else None
+                                    )
+                                    reset_ret_results()
+                                    for w in warns2:
                                         _warn(w)
                                     if msgs2:
                                         with st.expander("Fetch details",
-                                                         expanded=True):
+                                                         expanded=False):
                                             for m in msgs2:
                                                 st.caption(m)
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Opp fetch failed: {e}")
 
-                if st.session_state.opp_df is not None:
-                    n_opps = len(st.session_state.opp_df)
-                    opp_arr_col = detect_arr_col(st.session_state.opp_df)
-                    total_pipe  = (st.session_state.opp_df[opp_arr_col]
-                                   .apply(parse_arr).sum()
-                                   if opp_arr_col else 0.0)
-                    _metrics_row(
-                        _metric("Open Opps", n_opps, green=True),
-                        _metric("Forecast Amount",
-                                f"${total_pipe:,.0f}" if opp_arr_col else "—"),
-                    )
-                    _info(
-                        "Opps will be assigned to the same rep as their account. "
-                        "No separate opp distribution algorithm is applied."
-                    )
+                    if st.session_state.ret_opp_df is not None:
+                        n_opps_r   = len(st.session_state.ret_opp_df)
+                        opp_arr_r  = detect_arr_col(st.session_state.ret_opp_df)
+                        total_pipe_r = (
+                            st.session_state.ret_opp_df[opp_arr_r]
+                            .apply(parse_arr).sum() if opp_arr_r else 0.0
+                        )
+                        _metrics_row(
+                            _metric("Open Opps", n_opps_r, green=True),
+                            _metric("Forecast Amount",
+                                    f"${total_pipe_r:,.0f}"
+                                    if opp_arr_r else "—"),
+                        )
+                else:
+                    st.session_state.ret_opp_df = None
+
+        # ── Step R4 — Run Return ─────────────────────────────────────────────
+        with st.expander("Step 4 — Run Return",
+                         expanded=ret_step2_done and not st.session_state.ret_run_done):
+            if not ret_step2_done:
+                _info("Complete Steps 1–2 first.")
             else:
-                st.session_state.opp_df = None
+                include_opps_r = st.session_state.ret_include_opps
+                opp_ready_r    = (not include_opps_r) or (
+                    st.session_state.ret_opp_df is not None)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 5 — Run + Results
-    # ═══════════════════════════════════════════════════════════════════════
-    with st.expander("Step 5 — Run Distribution",
-                     expanded=step3_done and not st.session_state.run_done):
-        if not step3_done:
-            _info("Complete Steps 1–3 first.")
-        else:
-            include_opps = st.session_state.include_opps
-            opp_ready    = (not include_opps) or (st.session_state.opp_df is not None)
+                if not opp_ready_r:
+                    _warn("You checked 'Include open opportunities' but "
+                          "haven't loaded the opp data yet.")
 
-            if not opp_ready:
-                _warn("You checked 'Include open opportunities' but haven't loaded the opp file yet.")
+                col_run_r, _ = st.columns([2, 5])
+                run_r = col_run_r.button(
+                    "Run Return",
+                    disabled=not opp_ready_r,
+                    type="primary",
+                    use_container_width=True,
+                    key="ret_run_btn",
+                )
 
-            col_run, _ = st.columns([2, 5])
-            run_clicked = col_run.button(
-                "Run Distribution",
-                disabled=(not opp_ready),
-                type="primary",
-                use_container_width=True
+                if run_r:
+                    with st.spinner("Preparing return file…"):
+                        acct_df_r = st.session_state.ret_acct_df.copy()
+                        opp_df_r  = (st.session_state.ret_opp_df.copy()
+                                     if include_opps_r and
+                                     st.session_state.ret_opp_df is not None
+                                     else None)
+                        arr_col_r  = detect_arr_col(acct_df_r)
+                        fy18_col_r = detect_fy18_col(acct_df_r)
+
+                        acct_out_r, opp_out_r, summary_r = reassign(
+                            acct_df_r, opp_df_r,
+                            st.session_state.ret_rep_name,
+                            st.session_state.ret_rep_id,
+                            fy18_col_r, arr_col_r,
+                        )
+
+                        rep = st.session_state.ret_rep_name
+                        fname_r = f"{rep} Territory Return.xlsx"
+
+                        full_r = build_excel(acct_out_r, opp_out_r, summary_r,
+                                             include_opps_r, full=True)
+                        fs_r   = build_excel(acct_out_r, opp_out_r, summary_r,
+                                             include_opps_r, full=False)
+
+                        st.session_state.ret_result_full     = full_r
+                        st.session_state.ret_result_fs       = fs_r
+                        st.session_state.ret_result_filename = fname_r
+                        st.session_state.ret_summary         = summary_r
+                        st.session_state.ret_run_done        = True
+                        st.rerun()
+
+        # ── Return results panel ─────────────────────────────────────────────
+        if st.session_state.ret_run_done:
+            st.divider()
+            st.markdown('<div class="section-title">Results</div>',
+                        unsafe_allow_html=True)
+            summary_r = st.session_state.ret_summary
+            row_r = summary_r.iloc[0]
+            _metrics_row(
+                _metric("Accounts Returned", int(row_r["Accounts Assigned"]),
+                        green=True),
+                _metric("Account ARR",
+                        f"${row_r['Account ARR']:,.0f}"),
+                _metric("Open Opps",
+                        int(row_r["Opps Assigned"])
+                        if st.session_state.ret_include_opps
+                        else "Not in scope"),
             )
 
-            if run_clicked:
-                with st.spinner("Distributing accounts…"):
-                    acct_df  = st.session_state.acct_df.copy()
-                    opp_df   = (st.session_state.opp_df.copy()
-                                if include_opps and st.session_state.opp_df is not None
-                                else None)
-                    reps     = st.session_state.receiving_reps
-                    arr_col  = detect_arr_col(acct_df)
-                    fy18_col = detect_fy18_col(acct_df)
-                    tag      = st.session_state.tag_name
+            st.divider()
+            st.markdown('<div class="section-title">Downloads &amp; Email</div>',
+                        unsafe_allow_html=True)
+            dl1_r, dl2_r, dl3_r = st.columns(3)
+            with dl1_r:
+                st.download_button(
+                    label="Download — Full File (Field Ops)",
+                    data=st.session_state.ret_result_full,
+                    file_name=st.session_state.ret_result_filename,
+                    mime="application/vnd.openxmlformats-officedocument"
+                         ".spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="primary",
+                    key="ret_dl_full",
+                )
+            with dl2_r:
+                fs_fname_r = st.session_state.ret_result_filename.replace(
+                    ".xlsx", " — FS Attachment.xlsx"
+                )
+                st.download_button(
+                    label="Download — FS Attachment",
+                    data=st.session_state.ret_result_fs,
+                    file_name=fs_fname_r,
+                    mime="application/vnd.openxmlformats-officedocument"
+                         ".spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="ret_dl_fs",
+                )
+            with dl3_r:
+                sender_r = st.text_input(
+                    "Your name (email signature)",
+                    value=st.session_state.sender_name,
+                    placeholder="e.g. Naman",
+                    key="ret_sender_input",
+                )
+                st.session_state.sender_name = sender_r
+                mailto_r = compose_mailto_return(
+                    st.session_state.ret_rep_name,
+                    int(row_r["Accounts Assigned"]),
+                    int(row_r["Opps Assigned"]),
+                    st.session_state.ret_include_opps,
+                    fs_fname_r,
+                    sender_name=sender_r,
+                )
+                st.link_button(
+                    "Compose Email to Field Services",
+                    url=mailto_r,
+                    use_container_width=True,
+                    key="ret_email_btn",
+                )
+            _info(
+                "Download the <strong>FS Attachment</strong> first, then click "
+                "<strong>Compose Email</strong> — your email client will open with "
+                "To/Subject/Body pre-filled. Attach the downloaded file manually."
+            )
 
-                    acct_out, opp_out, summary = distribute(
-                        acct_df, opp_df, reps,
-                        st.session_state.departing_name, tag,
-                        arr_col, fy18_col
+    # ═══════════════════════════════════════════════════════════════════════
+    # DISTRIBUTE TERRITORY FLOW
+    # ═══════════════════════════════════════════════════════════════════════
+    if st.session_state.mode == "distribute":
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 1 — Departing Rep
+        # ═══════════════════════════════════════════════════════════════════════
+        step1_done = bool(st.session_state.departing_name and
+                          st.session_state.departing_id)
+
+        with st.expander("Step 1 — Departing Rep", expanded=not step1_done):
+            c1, c2, c3 = st.columns([3, 3, 2])
+            with c1:
+                dep_name = st.text_input(
+                    "Full name", value=st.session_state.departing_name,
+                    placeholder="e.g. Sydney Clawson"
+                )
+            with c2:
+                dep_id = st.text_input(
+                    "Salesforce User ID (18-char)",
+                    value=st.session_state.departing_id,
+                    placeholder="0057V000…"
+                )
+            with c3:
+                tag_suffix = st.text_input(
+                    "FY18 tag suffix (optional)",
+                    value="",
+                    placeholder='e.g. "26" → Sydney Clawson 26',
+                    help='Appended after the name in the Prev Acct Owner tag. '
+                         'Leave blank for no suffix.'
+                )
+
+            # Live SFDC lookup
+            if st.session_state.connected and dep_name and not dep_id:
+                results = lookup_user_sfdc(sid, dep_name)
+                if results:
+                    options = {f"{r['Name']} ({r['Id']})": r for r in results}
+                    choice  = st.selectbox("Select rep from Salesforce", list(options))
+                    if st.button("Use this rep"):
+                        picked = options[choice]
+                        st.session_state.departing_name = picked["Name"]
+                        st.session_state.departing_id   = picked["Id"]
+                        sfx = f" {tag_suffix.strip()}" if tag_suffix.strip() else ""
+                        st.session_state.tag_name = picked["Name"] + sfx
+                        reset_results()
+                        st.rerun()
+
+            if st.button("Confirm Rep", key="confirm_rep"):
+                if dep_name and dep_id:
+                    st.session_state.departing_name = dep_name.strip()
+                    st.session_state.departing_id   = dep_id.strip()
+                    sfx = f" {tag_suffix.strip()}" if tag_suffix.strip() else ""
+                    st.session_state.tag_name = dep_name.strip() + sfx
+                    reset_results()
+                    _ok(f"Departing rep set: {dep_name} | FY18 tag: "
+                        f"Prev Acct Owner: {st.session_state.tag_name}")
+                else:
+                    _warn("Please enter both the rep name and Salesforce User ID.")
+
+        if step1_done:
+            _ok(f"Departing rep: **{st.session_state.departing_name}** "
+                f"| FY18 tag: *Prev Acct Owner: {st.session_state.tag_name}*")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 2 — Load Account Data
+        # ═══════════════════════════════════════════════════════════════════════
+        step2_done = st.session_state.acct_df is not None
+        with st.expander("Step 2 — Account Data", expanded=step1_done and not step2_done):
+            if not step1_done:
+                _info("Complete Step 1 first.")
+            else:
+                src = st.radio("Data source", ["Upload file", "Fetch from Salesforce"],
+                               horizontal=True, key="acct_src")
+                if src == "Upload file":
+                    f = st.file_uploader("Account file (XLS, XLSX, CSV)",
+                                         type=["xls", "xlsx", "csv"], key="acct_upload")
+                    if f and st.button("Load accounts"):
+                        try:
+                            df = parse_uploaded_file(f)
+                            # Filter to departing rep if Account Owner column exists
+                            oc = _find_col(df, ["account owner"])
+                            if oc:
+                                before = len(df)
+                                df = df[df[oc].str.strip() == st.session_state.departing_name]
+                                df = df.reset_index(drop=True)
+                                if len(df) == 0:
+                                    _warn(f"No rows matched owner '{st.session_state.departing_name}'. "
+                                          "Loaded all rows instead.")
+                                    df = parse_uploaded_file(f)
+                            st.session_state.acct_df = df
+                            reset_results()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not parse file: {e}")
+
+                else:  # Fetch from Salesforce
+                    if not st.session_state.connected:
+                        _warn("Connect to Salesforce first (sidebar).")
+                    else:
+                        if not st.session_state.departing_id:
+                            _warn("Enter the departing rep's Salesforce User ID in Step 1.")
+                        else:
+                            _info(
+                                f"Queries Salesforce directly via SOQL — all accounts "
+                                f"owned by <strong>{st.session_state.departing_name}</strong> "
+                                f"({st.session_state.departing_id}). "
+                                f"No row-count limit. Custom fields auto-discovered."
+                            )
+                            if st.button("Fetch accounts from Salesforce"):
+                                with st.spinner("Querying accounts…"):
+                                    try:
+                                        msgs = []
+                                        rows, warns = fetch_accounts_soql(
+                                            sid,
+                                            owner_id=st.session_state.departing_id,
+                                            arr_field_override=arr_field_override,
+                                            status_fn=lambda m: msgs.append(m)
+                                        )
+                                        df = pd.DataFrame(rows).fillna("")
+                                        st.session_state.acct_df      = df
+                                        st.session_state.dropped_acct = warns
+                                        st.session_state.fetch_msgs   = msgs
+                                        reset_results()
+                                        for w in warns:
+                                            _warn(w)
+                                        if msgs:
+                                            with st.expander("Fetch details",
+                                                             expanded=True):
+                                                for m in msgs:
+                                                    st.caption(m)
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Account fetch failed: {e}")
+
+        if step2_done:
+            df = st.session_state.acct_df
+            arr_col  = detect_arr_col(df)
+            fy18_col = detect_fy18_col(df)
+            type_col = _find_col(df, ["account type", "type"])
+            n_cust   = int(df[type_col].apply(_is_customer).sum()) if type_col else 0
+            n_other  = len(df) - n_cust
+            total_arr = df[arr_col].apply(parse_arr).sum() if arr_col else 0.0
+
+            _metrics_row(
+                _metric("Accounts", len(df)),
+                _metric("Customers", n_cust, green=True),
+                _metric("Non-Customers", n_other),
+                _metric("Total ARR", f"${total_arr:,.0f}") if arr_col else _metric("ARR col", "Not found"),
+            )
+            if not arr_col:
+                _warn("No ARR column detected — customers will be distributed by count only.")
+            if not fy18_col:
+                _warn("No FY18 Sales Planning column detected — tagging will be skipped.")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 3 — Receiving Team
+        # ═══════════════════════════════════════════════════════════════════════
+        step3_done = len(st.session_state.receiving_reps) > 0
+        with st.expander("Step 3 — Receiving Team", expanded=step2_done and not step3_done):
+            if not step2_done:
+                _info("Complete Step 2 first.")
+            else:
+                # ── Roster source ─────────────────────────────────────────────
+                st.markdown('<div class="section-title">Roster</div>',
+                            unsafe_allow_html=True)
+                _info(
+                    f"Built-in roster: **Global SMB Roster ({ROSTER_AS_OF})** — "
+                    f"{len(_EMBEDDED_ROSTER_DF)} reps across "
+                    f"{_EMBEDDED_ROSTER_DF['division'].nunique()} divisions.  "
+                    "Upload a newer file below to override."
+                )
+                roster_file = st.file_uploader(
+                    "Upload updated roster (XLS, XLSX, CSV) — optional",
+                    type=["xls", "xlsx", "csv"], key="roster_upload"
+                )
+                if roster_file:
+                    try:
+                        raw    = parse_uploaded_file(roster_file)
+                        parsed = parse_roster(raw)
+                        st.session_state.roster_df = parsed
+                        _ok(f"Uploaded roster loaded: {len(parsed)} reps.")
+                    except Exception as e:
+                        st.error(f"Could not parse roster: {e}")
+                        st.session_state.roster_df = None
+
+                # Use uploaded override if available, otherwise fall back to embedded
+                roster: pd.DataFrame = (
+                    st.session_state.roster_df
+                    if st.session_state.roster_df is not None
+                    else get_embedded_roster()
+                )
+
+                # ── Division filter ───────────────────────────────────────────
+                st.markdown('<div class="section-title">Filter Roster</div>',
+                            unsafe_allow_html=True)
+                divisions = sorted(roster["division"].dropna().unique().tolist())
+                divisions = [d for d in divisions if d not in ("", "nan")]
+                all_div_label = "— All Divisions —"
+                div_options   = [all_div_label] + divisions
+
+                selected_division = st.selectbox(
+                    "Division", div_options, key="division_sel"
+                )
+                if selected_division == all_div_label:
+                    div_filtered = roster
+                else:
+                    div_filtered = roster[roster["division"] == selected_division]
+
+                # ── Leader filter (scoped to chosen division) ─────────────────
+                leaders = sorted(div_filtered["manager"].dropna().unique().tolist())
+                leaders = [l for l in leaders if l not in ("", "nan")]
+                all_mgr_label  = "— All Leaders —"
+                leader_options = [all_mgr_label] + leaders
+
+                selected_leader = st.selectbox(
+                    "Leader / Manager", leader_options, key="leader_sel"
+                )
+                if selected_leader == all_mgr_label:
+                    filtered = div_filtered
+                else:
+                    filtered = div_filtered[div_filtered["manager"] == selected_leader]
+
+                # Exclude the departing rep from the receiving list
+                filtered = filtered[
+                    filtered["rep_name"] != st.session_state.departing_name
+                ].reset_index(drop=True)
+
+                if len(filtered) == 0:
+                    _warn("No eligible reps found after filtering.")
+                else:
+                    st.markdown(
+                        f'<div class="section-title">'
+                        f'Select Receiving Reps ({len(filtered)} eligible)</div>',
+                        unsafe_allow_html=True
                     )
+                    selected = []
+                    cols_per_row = 2
+                    rows_needed  = math.ceil(len(filtered) / cols_per_row)
+                    for row_i in range(rows_needed):
+                        row_cols = st.columns(cols_per_row)
+                        for ci in range(cols_per_row):
+                            idx = row_i * cols_per_row + ci
+                            if idx >= len(filtered):
+                                break
+                            rep   = filtered.iloc[idx]
+                            label = (
+                                rep["rep_name"]
+                                + (f"  ·  {rep['region']}" if rep.get("region") else "")
+                            )
+                            if row_cols[ci].checkbox(label, value=True,
+                                                     key=f"rep_{rep['rep_id']}"):
+                                selected.append({"name": rep["rep_name"],
+                                                 "id":   rep["rep_id"]})
 
-                    dep = st.session_state.departing_name
-                    fname = f"{dep} Territory Distribution.xlsx"
+                    if st.button("Confirm Team", key="confirm_team"):
+                        if len(selected) < 1:
+                            _warn("Select at least one receiving rep.")
+                        else:
+                            st.session_state.receiving_reps = selected
+                            reset_results()
+                            _ok(f"{len(selected)} reps confirmed.")
+                            st.rerun()
 
-                    full_bytes = build_excel(acct_out, opp_out, summary,
-                                             include_opps, full=True)
-                    fs_bytes   = build_excel(acct_out, opp_out, summary,
-                                             include_opps, full=False)
+        if step3_done:
+            names = [r["name"] for r in st.session_state.receiving_reps]
+            _ok(f"Receiving team ({len(names)}): " + " · ".join(names))
 
-                    st.session_state.result_full     = full_bytes
-                    st.session_state.result_fs       = fs_bytes
-                    st.session_state.result_filename = fname
-                    st.session_state.dist_summary    = summary
-                    st.session_state.run_done        = True
-                    st.rerun()
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 4 — Open Pipeline (optional)
+        # ═══════════════════════════════════════════════════════════════════════
+        with st.expander("Step 4 — Open Pipeline (optional)",
+                         expanded=step3_done and not st.session_state.run_done):
+            if not step3_done:
+                _info("Complete Step 3 first.")
+            else:
+                include = st.checkbox(
+                    "Include open opportunities in this redistribution",
+                    value=st.session_state.include_opps,
+                    key="include_opps_cb"
+                )
+                st.session_state.include_opps = include
 
-    # ── Results panel ────────────────────────────────────────────────────────
-    if st.session_state.run_done:
-        st.divider()
-        st.markdown('<div class="section-title">Results</div>',
-                    unsafe_allow_html=True)
+                if include:
+                    src2 = st.radio("Opp data source",
+                                    ["Upload file", "Fetch from Salesforce"],
+                                    horizontal=True, key="opp_src")
+                    if src2 == "Upload file":
+                        f2 = st.file_uploader("Open pipeline file (XLS, XLSX, CSV)",
+                                              type=["xls", "xlsx", "csv"],
+                                              key="opp_upload")
+                        if f2 and st.button("Load opps"):
+                            try:
+                                st.session_state.opp_df = parse_uploaded_file(f2)
+                                reset_results()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not parse file: {e}")
+                    else:
+                        if not st.session_state.connected:
+                            _warn("Connect to Salesforce first (sidebar).")
+                        else:
+                            _info(
+                                f"Queries Salesforce directly via SOQL — all open "
+                                f"opportunities owned by "
+                                f"<strong>{st.session_state.departing_name}</strong>."
+                            )
+                            if st.button("Fetch opps from Salesforce"):
+                                with st.spinner("Querying open opportunities…"):
+                                    try:
+                                        msgs2 = []
+                                        rows, warns = fetch_opps_soql(
+                                            sid,
+                                            owner_id=st.session_state.departing_id,
+                                            amount_field_override=opp_amount_override,
+                                            status_fn=lambda m: msgs2.append(m)
+                                        )
+                                        st.session_state.opp_df      = pd.DataFrame(rows).fillna("")
+                                        st.session_state.dropped_opp = warns
+                                        reset_results()
+                                        for w in warns:
+                                            _warn(w)
+                                        if msgs2:
+                                            with st.expander("Fetch details",
+                                                             expanded=True):
+                                                for m in msgs2:
+                                                    st.caption(m)
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Opp fetch failed: {e}")
 
-        summary = st.session_state.dist_summary
-        reps_only = summary[summary["Rep Name"] != "TOTAL"]
-        total_row = summary[summary["Rep Name"] == "TOTAL"].iloc[0]
+                    if st.session_state.opp_df is not None:
+                        n_opps = len(st.session_state.opp_df)
+                        opp_arr_col = detect_arr_col(st.session_state.opp_df)
+                        total_pipe  = (st.session_state.opp_df[opp_arr_col]
+                                       .apply(parse_arr).sum()
+                                       if opp_arr_col else 0.0)
+                        _metrics_row(
+                            _metric("Open Opps", n_opps, green=True),
+                            _metric("Forecast Amount",
+                                    f"${total_pipe:,.0f}" if opp_arr_col else "—"),
+                        )
+                        _info(
+                            "Opps will be assigned to the same rep as their account. "
+                            "No separate opp distribution algorithm is applied."
+                        )
+                else:
+                    st.session_state.opp_df = None
 
-        # Metrics row
-        _metrics_row(
-            _metric("Total Accounts", int(total_row["Accounts Assigned"]), green=True),
-            _metric("Receiving Reps", len(reps_only)),
-            _metric("Open Opps", int(total_row["Opps Assigned"]))
-            if st.session_state.include_opps
-            else _metric("Open Opps", "Not in scope"),
-        )
+        # ═══════════════════════════════════════════════════════════════════════
+        # STEP 5 — Run + Results
+        # ═══════════════════════════════════════════════════════════════════════
+        with st.expander("Step 5 — Run Distribution",
+                         expanded=step3_done and not st.session_state.run_done):
+            if not step3_done:
+                _info("Complete Steps 1–3 first.")
+            else:
+                include_opps = st.session_state.include_opps
+                opp_ready    = (not include_opps) or (st.session_state.opp_df is not None)
 
-        # Summary table
-        display_cols = ["Rep Name", "Accounts Assigned", "Account ARR"]
-        if st.session_state.include_opps:
-            display_cols.append("Opps Assigned")
-        st.dataframe(
-            reps_only[display_cols].style.format({"Account ARR": "${:,.0f}"}),
-            use_container_width=True, hide_index=True
-        )
+                if not opp_ready:
+                    _warn("You checked 'Include open opportunities' but haven't loaded the opp file yet.")
 
-        st.divider()
-        st.markdown('<div class="section-title">Downloads & Email</div>',
-                    unsafe_allow_html=True)
+                col_run, _ = st.columns([2, 5])
+                run_clicked = col_run.button(
+                    "Run Distribution",
+                    disabled=(not opp_ready),
+                    type="primary",
+                    use_container_width=True
+                )
 
-        # Two download buttons + email button
-        dl1, dl2, dl3 = st.columns(3)
+                if run_clicked:
+                    with st.spinner("Distributing accounts…"):
+                        acct_df  = st.session_state.acct_df.copy()
+                        opp_df   = (st.session_state.opp_df.copy()
+                                    if include_opps and st.session_state.opp_df is not None
+                                    else None)
+                        reps     = st.session_state.receiving_reps
+                        arr_col  = detect_arr_col(acct_df)
+                        fy18_col = detect_fy18_col(acct_df)
+                        tag      = st.session_state.tag_name
 
-        with dl1:
-            st.download_button(
-                label="Download — Full File (Field Ops)",
-                data=st.session_state.result_full,
-                file_name=st.session_state.result_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary",
+                        acct_out, opp_out, summary = distribute(
+                            acct_df, opp_df, reps,
+                            st.session_state.departing_name, tag,
+                            arr_col, fy18_col
+                        )
+
+                        dep = st.session_state.departing_name
+                        fname = f"{dep} Territory Distribution.xlsx"
+
+                        full_bytes = build_excel(acct_out, opp_out, summary,
+                                                 include_opps, full=True)
+                        fs_bytes   = build_excel(acct_out, opp_out, summary,
+                                                 include_opps, full=False)
+
+                        st.session_state.result_full     = full_bytes
+                        st.session_state.result_fs       = fs_bytes
+                        st.session_state.result_filename = fname
+                        st.session_state.dist_summary    = summary
+                        st.session_state.run_done        = True
+                        st.rerun()
+
+        # ── Results panel ────────────────────────────────────────────────────────
+        if st.session_state.run_done:
+            st.divider()
+            st.markdown('<div class="section-title">Results</div>',
+                        unsafe_allow_html=True)
+
+            summary = st.session_state.dist_summary
+            reps_only = summary[summary["Rep Name"] != "TOTAL"]
+            total_row = summary[summary["Rep Name"] == "TOTAL"].iloc[0]
+
+            # Metrics row
+            _metrics_row(
+                _metric("Total Accounts", int(total_row["Accounts Assigned"]), green=True),
+                _metric("Receiving Reps", len(reps_only)),
+                _metric("Open Opps", int(total_row["Opps Assigned"]))
+                if st.session_state.include_opps
+                else _metric("Open Opps", "Not in scope"),
             )
-        with dl2:
-            fs_fname = st.session_state.result_filename.replace(
-                ".xlsx", " — FS Attachment.xlsx"
-            )
-            st.download_button(
-                label="Download — FS Attachment",
-                data=st.session_state.result_fs,
-                file_name=fs_fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with dl3:
-            sender_input = st.text_input(
-                "Your name (email signature)",
-                value=st.session_state.sender_name,
-                placeholder="e.g. Naman",
-                key="sender_name_input",
-            )
-            st.session_state.sender_name = sender_input
-            n_accts = int(total_row["Accounts Assigned"])
-            n_opps  = int(total_row["Opps Assigned"])
-            mailto  = compose_mailto(
-                st.session_state.departing_name,
-                n_accts, n_opps,
-                st.session_state.include_opps,
-                fs_fname,
-                sender_name=st.session_state.sender_name,
-            )
-            st.link_button(
-                "Compose Email to Field Services",
-                url=mailto,
-                use_container_width=True,
+
+            # Summary table
+            display_cols = ["Rep Name", "Accounts Assigned", "Account ARR"]
+            if st.session_state.include_opps:
+                display_cols.append("Opps Assigned")
+            st.dataframe(
+                reps_only[display_cols].style.format({"Account ARR": "${:,.0f}"}),
+                use_container_width=True, hide_index=True
             )
 
-        _info(
-            "Download the <strong>FS Attachment</strong> first, then click "
-            "<strong>Compose Email</strong> — your email client will open with "
-            "To/Subject/Body pre-filled. Attach the downloaded file manually."
-        )
+            st.divider()
+            st.markdown('<div class="section-title">Downloads & Email</div>',
+                        unsafe_allow_html=True)
+
+            # Two download buttons + email button
+            dl1, dl2, dl3 = st.columns(3)
+
+            with dl1:
+                st.download_button(
+                    label="Download — Full File (Field Ops)",
+                    data=st.session_state.result_full,
+                    file_name=st.session_state.result_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with dl2:
+                fs_fname = st.session_state.result_filename.replace(
+                    ".xlsx", " — FS Attachment.xlsx"
+                )
+                st.download_button(
+                    label="Download — FS Attachment",
+                    data=st.session_state.result_fs,
+                    file_name=fs_fname,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with dl3:
+                sender_input = st.text_input(
+                    "Your name (email signature)",
+                    value=st.session_state.sender_name,
+                    placeholder="e.g. Naman",
+                    key="sender_name_input",
+                )
+                st.session_state.sender_name = sender_input
+                n_accts = int(total_row["Accounts Assigned"])
+                n_opps  = int(total_row["Opps Assigned"])
+                mailto  = compose_mailto(
+                    st.session_state.departing_name,
+                    n_accts, n_opps,
+                    st.session_state.include_opps,
+                    fs_fname,
+                    sender_name=st.session_state.sender_name,
+                )
+                st.link_button(
+                    "Compose Email to Field Services",
+                    url=mailto,
+                    use_container_width=True,
+                )
+
+            _info(
+                "Download the <strong>FS Attachment</strong> first, then click "
+                "<strong>Compose Email</strong> — your email client will open with "
+                "To/Subject/Body pre-filled. Attach the downloaded file manually."
+            )
 
 
 if __name__ == "__main__":
