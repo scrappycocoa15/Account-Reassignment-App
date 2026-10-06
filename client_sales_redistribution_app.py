@@ -2376,7 +2376,6 @@ def main():
 
         # ── Step R1 — Returning / Incoming Rep ──────────────────────────────
         ret_step1_done = bool(st.session_state.ret_rep_name and
-                              st.session_state.ret_rep_id and
                               st.session_state.ret_tag_string)
 
         with st.expander("Step 1 — Returning / Incoming Rep",
@@ -2402,13 +2401,15 @@ def main():
             c3, c4 = st.columns(2)
             with c3:
                 ret_tag = st.text_input(
-                    "Tag string to match",
+                    "Original rep's name",
                     value=st.session_state.ret_tag_string or ret_name,
-                    placeholder="e.g. Jordan Breisacher  or  Kaitlin Dailey 25",
+                    placeholder="e.g. Jordan Breisacher",
                     key="ret_tag_input",
-                    help="Exact string that appears after 'Prev Acct Owner:' in the "
-                         "FY18 field. Defaults to the name above — override if a "
-                         "year suffix was appended when accounts were distributed.",
+                    help="The name that appears in the Prev Acct Owner tag — "
+                         "i.e. whose accounts are being returned. For a rep coming "
+                         "back from leave this is the same as the name above. For a "
+                         "new hire taking over a territory, enter the departed rep's "
+                         "name here instead.",
                 )
             with c4:
                 ret_mgr = st.text_input(
@@ -2437,7 +2438,7 @@ def main():
                         st.rerun()
 
             if st.button("Confirm Rep", key="ret_confirm_rep"):
-                if ret_name and ret_id and ret_tag:
+                if ret_name and ret_tag:
                     st.session_state.ret_rep_name   = ret_name.strip()
                     st.session_state.ret_rep_id     = ret_id.strip()
                     st.session_state.ret_tag_string = ret_tag.strip()
@@ -2447,7 +2448,7 @@ def main():
                         f"*Prev Acct Owner: {ret_tag}*"
                         + (f" | Manager filter: *{ret_mgr}*" if ret_mgr else ""))
                 else:
-                    _warn("Please enter name, Salesforce User ID, and tag string.")
+                    _warn("Please enter a name and tag string.")
 
         if ret_step1_done:
             _ok(
@@ -2608,6 +2609,22 @@ def main():
                 include_opps_r = st.session_state.ret_include_opps
                 opp_ready_r    = (not include_opps_r) or (
                     st.session_state.ret_opp_df is not None)
+                id_missing     = not st.session_state.ret_rep_id
+
+                if id_missing:
+                    ret_id_late = st.text_input(
+                        "Salesforce User ID (18-char) — required to run",
+                        value="",
+                        placeholder="0057V000…",
+                        key="ret_id_late",
+                        help="Enter the SFDC User ID of the returning or incoming rep. "
+                             "For a new hire, use the ID provisioned in Salesforce.",
+                    )
+                    if ret_id_late.strip():
+                        st.session_state.ret_rep_id = ret_id_late.strip()
+                        st.rerun()
+                    else:
+                        _warn("Enter the rep's Salesforce User ID above before running.")
 
                 if not opp_ready_r:
                     _warn("You checked 'Include open opportunities' but "
@@ -2616,7 +2633,7 @@ def main():
                 col_run_r, _ = st.columns([2, 5])
                 run_r = col_run_r.button(
                     "Run Return",
-                    disabled=not opp_ready_r,
+                    disabled=(not opp_ready_r or id_missing),
                     type="primary",
                     use_container_width=True,
                     key="ret_run_btn",
