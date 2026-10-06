@@ -948,7 +948,7 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
     # 1a — find the manager's own User ID by name (Name field is indexed)
     mgr_soql = (
         f"SELECT Id, Name FROM User "
-        f"WHERE Name LIKE '%{safe_mgr}%' AND IsActive = true LIMIT 5"
+        f"WHERE Name LIKE '%{safe_mgr}%' LIMIT 5"
     )
     try:
         mgr_records = _soql_query_all(sid, mgr_soql, status_fn=status_fn)
