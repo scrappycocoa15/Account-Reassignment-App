@@ -914,28 +914,33 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
                           fy18_field_override: str = "",
                           status_fn=None) -> tuple:
     """
-    Fetch all Account records whose FY18 Sales Planning field contains
-    'Prev Acct Owner: <tag_string>' (case-insensitive LIKE match).
+    Fetch Account records whose FY18 Sales Planning field contains
+    'Prev Acct Owner: <tag_string>' (case-insensitive).
 
-    Optionally narrows results to accounts currently owned by reps who
-    report to manager_filter (partial name match on Owner.Manager.Name).
+    Strategy: query by Owner.Manager.Name (avoids SOQL LIKE on the FY18 field,
+    which fails when that field is a Long Text Area), then filter in Python.
+    Manager filter is required to keep the query scoped and efficient.
 
     Returns (list_of_row_dicts, fy18_api_name, warnings).
     """
     warnings_out = []
 
-    # ── Discover field API names ────────────────────────────────────────────
-    if status_fn:
-        status_fn("Discovering ARR and FY18 field API names…")
+    if not manager_filter or not manager_filter.strip():
+        raise ValueError(
+            "Manager filter is required. Enter the name of the manager whose "
+            "team currently holds these accounts (e.g. 'Jake Rutenbar')."
+        )
 
-    # ARR: reuse full discovery (describe-based passes work without owner_id)
-    arr_label, arr_api, _fy18_ignored, _ignored2 = _discover_account_fields(
+    # Discover field API names
+    if status_fn:
+        status_fn("Discovering ARR and FY18 field API names...")
+
+    arr_label, arr_api, _unused, _unused2 = _discover_account_fields(
         sid, owner_id=None, status_fn=status_fn
     )
     if arr_field_override and arr_field_override.strip():
         arr_api = arr_field_override.strip()
 
-    # FY18: use the targeted probe that doesn't need an owner_id
     if fy18_field_override and fy18_field_override.strip():
         fy18_api = fy18_field_override.strip()
     else:
@@ -947,8 +952,9 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
             "Enter its API name in the sidebar 'FY18 field API name' box."
         )
 
-    # ── Build SOQL ──────────────────────────────────────────────────────────
-    safe_tag = tag_string.replace("'", "\\'")
+    # Build SOQL - filter by manager only, no LIKE on FY18
+    # Filtering FY18 via SOQL LIKE fails on Long Text Area fields.
+    # Query by manager and filter FY18 tag content in Python instead.
     select_parts = [
         "Id", "Name", "OwnerId", "Owner.Name", "Owner.Manager.Name",
         "Type", "Rating", "LastActivityDate",
@@ -957,19 +963,26 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
         select_parts.append(arr_api)
     select_parts.append(fy18_api)
 
-    where = f"{fy18_api} LIKE '%Prev Acct Owner: {safe_tag}%'"
-    if manager_filter and manager_filter.strip():
-        safe_mgr = manager_filter.strip().replace("'", "\\'")
-        where += f" AND Owner.Manager.Name LIKE '%{safe_mgr}%'"
-
-    soql = f"SELECT {', '.join(select_parts)} FROM Account WHERE {where}"
+    safe_mgr = manager_filter.strip().replace("'", "\\'")
+    soql = (f"SELECT {', '.join(select_parts)} FROM Account "
+            f"WHERE Owner.Manager.Name LIKE '%{safe_mgr}%'")
 
     if status_fn:
-        status_fn(f"Querying accounts with tag 'Prev Acct Owner: {tag_string}'…")
-    records = _soql_query_all(sid, soql, status_fn=status_fn)
+        status_fn(
+            f"Querying accounts under '{manager_filter}' "
+            f"-- will filter for 'Prev Acct Owner: {tag_string}' in Python..."
+        )
+    all_records = _soql_query_all(sid, soql, status_fn=status_fn)
+    if status_fn:
+        status_fn(f"Fetched {len(all_records):,} accounts -- applying tag filter...")
 
+    # Filter in Python
+    needle = f"prev acct owner: {tag_string}".lower()
     rows = []
-    for rec in records:
+    for rec in all_records:
+        fy18_val = str(rec.get(fy18_api) or "")
+        if needle not in fy18_val.lower():
+            continue
         owner = rec.get("Owner") or {}
         mgr   = owner.get("Manager") or {}
         row   = {
@@ -990,14 +1003,18 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
                 )
             except (TypeError, ValueError):
                 row["Contractual ARR (converted)"] = str(val) if val is not None else ""
-        row["FY18 Sales Planning"] = str(rec.get(fy18_api) or "")
+        row["FY18 Sales Planning"] = fy18_val
         rows.append(row)
 
     if not arr_api:
-        warnings_out.append("No ARR field found — ARR will show as blank.")
+        warnings_out.append("No ARR field found -- ARR will show as blank.")
     if status_fn:
-        status_fn(f"Done — {len(rows):,} accounts found.")
+        status_fn(
+            f"Done -- {len(rows):,} matching accounts "
+            f"(out of {len(all_records):,} under '{manager_filter}')."
+        )
     return rows, fy18_api, warnings_out
+
 
 
 def fetch_opps_by_account_ids(sid: str, account_ids: list,
@@ -2451,7 +2468,8 @@ def main():
 
         # ── Step R1 — Returning / Incoming Rep ──────────────────────────────
         ret_step1_done = bool(st.session_state.ret_rep_name and
-                              st.session_state.ret_tag_string)
+                              st.session_state.ret_tag_string and
+                              st.session_state.ret_manager)
 
         with st.expander("Step 1 — Returning / Incoming Rep",
                          expanded=not ret_step1_done):
@@ -2488,13 +2506,13 @@ def main():
                 )
             with c4:
                 ret_mgr = st.text_input(
-                    "Manager filter (optional)",
+                    "Manager (required)",
                     value=st.session_state.ret_manager,
                     placeholder="e.g. Jake Rutenbar",
                     key="ret_mgr_input",
-                    help="Narrows results to accounts currently held by reps who "
-                         "report to this manager. Leave blank to pull all matching "
-                         "accounts regardless of current manager.",
+                    help="The manager whose team currently holds these accounts. "
+                         "Used to scope the Salesforce query — accounts are fetched "
+                         "by manager and then filtered by the original rep's name.",
                 )
 
             # Live SFDC lookup
@@ -2513,17 +2531,16 @@ def main():
                         st.rerun()
 
             if st.button("Confirm Rep", key="ret_confirm_rep"):
-                if ret_name and ret_tag:
+                if ret_name and ret_tag and ret_mgr:
                     st.session_state.ret_rep_name   = ret_name.strip()
                     st.session_state.ret_rep_id     = ret_id.strip()
                     st.session_state.ret_tag_string = ret_tag.strip()
                     st.session_state.ret_manager    = ret_mgr.strip()
                     reset_ret_results()
                     _ok(f"Rep set: **{ret_name}** | Matching tag: "
-                        f"*Prev Acct Owner: {ret_tag}*"
-                        + (f" | Manager filter: *{ret_mgr}*" if ret_mgr else ""))
+                        f"*Prev Acct Owner: {ret_tag}* | Manager: *{ret_mgr}*")
                 else:
-                    _warn("Please enter a name and tag string.")
+                    _warn("Please enter name, original rep's name, and manager.")
 
         if ret_step1_done:
             _ok(
