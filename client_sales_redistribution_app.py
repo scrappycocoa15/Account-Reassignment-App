@@ -917,9 +917,12 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
     Fetch Account records whose FY18 Sales Planning field contains
     'Prev Acct Owner: <tag_string>' (case-insensitive).
 
-    Strategy: query by Owner.Manager.Name (avoids SOQL LIKE on the FY18 field,
-    which fails when that field is a Long Text Area), then filter in Python.
-    Manager filter is required to keep the query scoped and efficient.
+    Two-step strategy to avoid slow relationship traversal and Long Text Area
+    LIKE limitations:
+      1. Look up User IDs of direct reports under the manager (fast SOQL on
+         indexed User fields).
+      2. Query accounts WHERE OwnerId IN (...) — indexed, no timeout risk.
+      3. Filter FY18 tag content in Python (avoids SOQL LIKE on LongTextArea).
 
     Returns (list_of_row_dicts, fy18_api_name, warnings).
     """
@@ -927,16 +930,39 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
 
     if not manager_filter or not manager_filter.strip():
         raise ValueError(
-            "Manager filter is required. Enter the name of the manager whose "
+            "Manager is required. Enter the name of the manager whose "
             "team currently holds these accounts (e.g. 'Jake Rutenbar')."
         )
 
-    # Discover field API names
+    # Step 1 — look up direct report User IDs under the manager
+    if status_fn:
+        status_fn(f"Looking up reps under '{manager_filter}'...")
+    safe_mgr = manager_filter.strip().replace("'", "\'")
+    user_soql = (
+        f"SELECT Id, Name FROM User "
+        f"WHERE Manager.Name LIKE '%{safe_mgr}%' AND IsActive = true"
+    )
+    try:
+        user_records = _soql_query_all(sid, user_soql, status_fn=status_fn)
+    except Exception as e:
+        raise ValueError(f"Could not look up reps under '{manager_filter}': {e}")
+
+    if not user_records:
+        raise ValueError(
+            f"No active reps found under manager '{manager_filter}'. "
+            "Check the spelling or try a partial name."
+        )
+    owner_ids = [u["Id"] for u in user_records]
+    if status_fn:
+        names = ", ".join(u["Name"] for u in user_records[:5])
+        more  = f" (+{len(user_records)-5} more)" if len(user_records) > 5 else ""
+        status_fn(f"Found {len(owner_ids)} rep(s): {names}{more}")
+
+    # Step 2 — discover field API names
     if status_fn:
         status_fn("Discovering ARR and FY18 field API names...")
-
     arr_label, arr_api, _unused, _unused2 = _discover_account_fields(
-        sid, owner_id=None, status_fn=status_fn
+        sid, owner_id=owner_ids[0], status_fn=status_fn
     )
     if arr_field_override and arr_field_override.strip():
         arr_api = arr_field_override.strip()
@@ -952,9 +978,7 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
             "Enter its API name in the sidebar 'FY18 field API name' box."
         )
 
-    # Build SOQL - filter by manager only, no LIKE on FY18
-    # Filtering FY18 via SOQL LIKE fails on Long Text Area fields.
-    # Query by manager and filter FY18 tag content in Python instead.
+    # Step 3 — fetch accounts by OwnerId IN (batched, indexed, fast)
     select_parts = [
         "Id", "Name", "OwnerId", "Owner.Name", "Owner.Manager.Name",
         "Type", "Rating", "LastActivityDate",
@@ -963,20 +987,27 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
         select_parts.append(arr_api)
     select_parts.append(fy18_api)
 
-    safe_mgr = manager_filter.strip().replace("'", "\\'")
-    soql = (f"SELECT {', '.join(select_parts)} FROM Account "
-            f"WHERE Owner.Manager.Name LIKE '%{safe_mgr}%'")
+    BATCH = 200
+    all_records = []
+    for i in range(0, len(owner_ids), BATCH):
+        batch    = owner_ids[i : i + BATCH]
+        id_list  = "', '".join(batch)
+        soql     = (
+            f"SELECT {', '.join(select_parts)} FROM Account "
+            f"WHERE OwnerId IN ('{id_list}')"
+        )
+        if status_fn:
+            status_fn(f"Fetching accounts batch {i//BATCH + 1}...")
+        batch_recs = _soql_query_all(sid, soql, status_fn=status_fn)
+        all_records.extend(batch_recs)
 
     if status_fn:
         status_fn(
-            f"Querying accounts under '{manager_filter}' "
-            f"-- will filter for 'Prev Acct Owner: {tag_string}' in Python..."
+            f"Fetched {len(all_records):,} total accounts "
+            f"-- filtering for 'Prev Acct Owner: {tag_string}'..."
         )
-    all_records = _soql_query_all(sid, soql, status_fn=status_fn)
-    if status_fn:
-        status_fn(f"Fetched {len(all_records):,} accounts -- applying tag filter...")
 
-    # Filter in Python
+    # Step 4 — filter FY18 content in Python (safe for LongTextArea)
     needle = f"prev acct owner: {tag_string}".lower()
     rows = []
     for rec in all_records:
@@ -1011,10 +1042,9 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
     if status_fn:
         status_fn(
             f"Done -- {len(rows):,} matching accounts "
-            f"(out of {len(all_records):,} under '{manager_filter}')."
+            f"(from {len(all_records):,} fetched under '{manager_filter}')."
         )
     return rows, fy18_api, warnings_out
-
 
 
 def fetch_opps_by_account_ids(sid: str, account_ids: list,
