@@ -914,7 +914,8 @@ def _probe_fy18_field(sid: str, status_fn=None) -> str | None:
     return None
 
 def fetch_accounts_by_tag(sid: str, tag_string: str,
-                          manager_filter: str = "",
+                          rep_ids: list,
+                          manager_name: str = "",
                           arr_field_override: str = "",
                           fy18_field_override: str = "",
                           status_fn=None) -> tuple:
@@ -922,76 +923,29 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
     Fetch Account records whose FY18 Sales Planning field contains
     'Prev Acct Owner: <tag_string>' (case-insensitive).
 
-    Two-step strategy to avoid slow relationship traversal and Long Text Area
-    LIKE limitations:
-      1. Look up User IDs of direct reports under the manager (fast SOQL on
-         indexed User fields).
-      2. Query accounts WHERE OwnerId IN (...) — indexed, no timeout risk.
-      3. Filter FY18 tag content in Python (avoids SOQL LIKE on LongTextArea).
+    rep_ids: list of SFDC User IDs for the reps currently holding accounts.
+             Resolved by the caller from the embedded/uploaded roster so no
+             SFDC User lookup is needed here.
+
+    Strategy:
+      1. Query accounts WHERE OwnerId IN (rep_ids) — OwnerId is indexed, fast.
+      2. Filter FY18 content in Python — avoids SOQL LIKE on Long Text Area.
 
     Returns (list_of_row_dicts, fy18_api_name, warnings).
     """
     warnings_out = []
 
-    if not manager_filter or not manager_filter.strip():
+    if not rep_ids:
         raise ValueError(
-            "Manager is required. Enter the name of the manager whose "
-            "team currently holds these accounts (e.g. 'Jake Rutenbar')."
+            "No rep IDs provided. Make sure the manager name matches entries "
+            "in the roster."
         )
 
-    # Step 1 — look up direct report User IDs under the manager (two sub-steps
-    # to avoid unindexed Manager.Name relationship traversal, which times out)
-    if status_fn:
-        status_fn(f"Looking up manager '{manager_filter}'...")
-    safe_mgr = manager_filter.strip().replace("'", "\\'")
-
-    # 1a — find the manager's own User ID by name (Name field is indexed)
-    mgr_soql = (
-        f"SELECT Id, Name FROM User "
-        f"WHERE Name LIKE '%{safe_mgr}%' LIMIT 5"
-    )
-    try:
-        mgr_records = _soql_query_all(sid, mgr_soql, status_fn=status_fn)
-    except Exception as e:
-        raise ValueError(f"Could not look up manager '{manager_filter}': {e}")
-
-    if not mgr_records:
-        raise ValueError(
-            f"No active user found matching '{manager_filter}'. "
-            "Check the spelling or try a partial name."
-        )
-    # Use the first match; if ambiguous the user can be more specific
-    manager_id   = mgr_records[0]["Id"]
-    manager_name = mgr_records[0]["Name"]
-    if status_fn:
-        status_fn(f"Manager resolved: {manager_name} ({manager_id})")
-
-    # 1b — fetch direct reports by ManagerId (indexed field, fast)
-    rep_soql = (
-        f"SELECT Id, Name FROM User "
-        f"WHERE ManagerId = '{manager_id}' AND IsActive = true"
-    )
-    try:
-        user_records = _soql_query_all(sid, rep_soql, status_fn=status_fn)
-    except Exception as e:
-        raise ValueError(f"Could not fetch reps under '{manager_name}': {e}")
-
-    if not user_records:
-        raise ValueError(
-            f"No active reps found under manager '{manager_filter}'. "
-            "Check the spelling or try a partial name."
-        )
-    owner_ids = [u["Id"] for u in user_records]
-    if status_fn:
-        names = ", ".join(u["Name"] for u in user_records[:5])
-        more  = f" (+{len(user_records)-5} more)" if len(user_records) > 5 else ""
-        status_fn(f"Found {len(owner_ids)} rep(s): {names}{more}")
-
-    # Step 2 — discover field API names
+    # Discover field API names (use first rep ID to help with FIELDS probe)
     if status_fn:
         status_fn("Discovering ARR and FY18 field API names...")
     arr_label, arr_api, _unused, _unused2 = _discover_account_fields(
-        sid, owner_id=owner_ids[0], status_fn=status_fn
+        sid, owner_id=rep_ids[0], status_fn=status_fn
     )
     if arr_field_override and arr_field_override.strip():
         arr_api = arr_field_override.strip()
@@ -1007,7 +961,7 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
             "Enter its API name in the sidebar 'FY18 field API name' box."
         )
 
-    # Step 3 — fetch accounts by OwnerId IN (batched, indexed, fast)
+    # Query accounts by OwnerId IN (indexed, no relationship traversal)
     select_parts = [
         "Id", "Name", "OwnerId", "Owner.Name", "Owner.Manager.Name",
         "Type", "Rating", "LastActivityDate",
@@ -1018,25 +972,25 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
 
     BATCH = 200
     all_records = []
-    for i in range(0, len(owner_ids), BATCH):
-        batch    = owner_ids[i : i + BATCH]
-        id_list  = "', '".join(batch)
-        soql     = (
+    for i in range(0, len(rep_ids), BATCH):
+        batch   = rep_ids[i : i + BATCH]
+        id_list = "', '".join(batch)
+        soql    = (
             f"SELECT {', '.join(select_parts)} FROM Account "
             f"WHERE OwnerId IN ('{id_list}')"
         )
         if status_fn:
-            status_fn(f"Fetching accounts batch {i//BATCH + 1}...")
-        batch_recs = _soql_query_all(sid, soql, status_fn=status_fn)
-        all_records.extend(batch_recs)
+            status_fn(f"Fetching accounts batch {i//BATCH + 1} "
+                      f"({min(i+BATCH, len(rep_ids))}/{len(rep_ids)} reps)...")
+        all_records.extend(_soql_query_all(sid, soql, status_fn=status_fn))
 
     if status_fn:
         status_fn(
             f"Fetched {len(all_records):,} total accounts "
-            f"-- filtering for 'Prev Acct Owner: {tag_string}'..."
+            f"— filtering for 'Prev Acct Owner: {tag_string}'..."
         )
 
-    # Step 4 — filter FY18 content in Python (safe for LongTextArea)
+    # Filter FY18 content in Python (safe for Long Text Area fields)
     needle = f"prev acct owner: {tag_string}".lower()
     rows = []
     for rec in all_records:
@@ -1067,11 +1021,12 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
         rows.append(row)
 
     if not arr_api:
-        warnings_out.append("No ARR field found -- ARR will show as blank.")
+        warnings_out.append("No ARR field found — ARR will show as blank.")
     if status_fn:
         status_fn(
-            f"Done -- {len(rows):,} matching accounts "
-            f"(from {len(all_records):,} fetched under '{manager_filter}')."
+            f"Done — {len(rows):,} matching accounts "
+            f"(from {len(all_records):,} fetched across "
+            f"{len(rep_ids)} rep(s) under '{manager_name or 'roster'}')."
         )
     return rows, fy18_api, warnings_out
 
@@ -2678,34 +2633,55 @@ def main():
                                key="ret_fetch_accts"):
                     with st.spinner("Querying accounts…"):
                         try:
-                            msgs = []
-                            rows, _fy18_api, warns = fetch_accounts_by_tag(
-                                sid,
-                                tag_string=st.session_state.ret_tag_string,
-                                manager_filter=st.session_state.ret_manager,
-                                arr_field_override=arr_field_override,
-                                fy18_field_override=fy18_field_override,
-                                status_fn=lambda m: msgs.append(m),
+                            # Resolve rep IDs from the roster (no SFDC User query)
+                            roster = (
+                                st.session_state.roster_df
+                                if st.session_state.roster_df is not None
+                                else get_embedded_roster()
                             )
-                            if not rows:
-                                _warn(
-                                    f"No accounts found with tag "
-                                    f"'Prev Acct Owner: "
-                                    f"{st.session_state.ret_tag_string}'. "
-                                    "Check the tag string or manager filter."
+                            mgr_filter = st.session_state.ret_manager.strip().lower()
+                            team = roster[
+                                roster["manager"].str.lower().str.contains(
+                                    mgr_filter, na=False
+                                )
+                            ]
+                            if len(team) == 0:
+                                st.error(
+                                    f"No reps found under '{st.session_state.ret_manager}' "
+                                    "in the roster. Check the spelling or upload an "
+                                    "updated roster in the Distribute tab."
                                 )
                             else:
-                                df = pd.DataFrame(rows).fillna("")
-                                st.session_state.ret_acct_df = df
-                                reset_ret_results()
-                                for w in warns:
-                                    _warn(w)
-                                if msgs:
-                                    with st.expander("Fetch details",
-                                                     expanded=False):
-                                        for m in msgs:
-                                            st.caption(m)
-                                st.rerun()
+                                rep_ids = team["rep_id"].tolist()
+                                msgs = []
+                                rows, _fy18_api, warns = fetch_accounts_by_tag(
+                                    sid,
+                                    tag_string=st.session_state.ret_tag_string,
+                                    rep_ids=rep_ids,
+                                    manager_name=st.session_state.ret_manager,
+                                    arr_field_override=arr_field_override,
+                                    fy18_field_override=fy18_field_override,
+                                    status_fn=lambda m: msgs.append(m),
+                                )
+                                if not rows:
+                                    _warn(
+                                        f"No accounts found with tag "
+                                        f"'Prev Acct Owner: "
+                                        f"{st.session_state.ret_tag_string}'. "
+                                        "Check the tag string or manager name."
+                                    )
+                                else:
+                                    df = pd.DataFrame(rows).fillna("")
+                                    st.session_state.ret_acct_df = df
+                                    reset_ret_results()
+                                    for w in warns:
+                                        _warn(w)
+                                    if msgs:
+                                        with st.expander("Fetch details",
+                                                         expanded=False):
+                                            for m in msgs:
+                                                st.caption(m)
+                                    st.rerun()
                         except ValueError as ve:
                             st.error(str(ve))
                         except Exception as e:
