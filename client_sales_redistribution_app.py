@@ -939,18 +939,42 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
             "team currently holds these accounts (e.g. 'Jake Rutenbar')."
         )
 
-    # Step 1 — look up direct report User IDs under the manager
+    # Step 1 — look up direct report User IDs under the manager (two sub-steps
+    # to avoid unindexed Manager.Name relationship traversal, which times out)
     if status_fn:
-        status_fn(f"Looking up reps under '{manager_filter}'...")
-    safe_mgr = manager_filter.strip().replace("'", "\'")
-    user_soql = (
+        status_fn(f"Looking up manager '{manager_filter}'...")
+    safe_mgr = manager_filter.strip().replace("'", "\\'")
+
+    # 1a — find the manager's own User ID by name (Name field is indexed)
+    mgr_soql = (
         f"SELECT Id, Name FROM User "
-        f"WHERE Manager.Name LIKE '%{safe_mgr}%' AND IsActive = true"
+        f"WHERE Name LIKE '%{safe_mgr}%' AND IsActive = true LIMIT 5"
     )
     try:
-        user_records = _soql_query_all(sid, user_soql, status_fn=status_fn)
+        mgr_records = _soql_query_all(sid, mgr_soql, status_fn=status_fn)
     except Exception as e:
-        raise ValueError(f"Could not look up reps under '{manager_filter}': {e}")
+        raise ValueError(f"Could not look up manager '{manager_filter}': {e}")
+
+    if not mgr_records:
+        raise ValueError(
+            f"No active user found matching '{manager_filter}'. "
+            "Check the spelling or try a partial name."
+        )
+    # Use the first match; if ambiguous the user can be more specific
+    manager_id   = mgr_records[0]["Id"]
+    manager_name = mgr_records[0]["Name"]
+    if status_fn:
+        status_fn(f"Manager resolved: {manager_name} ({manager_id})")
+
+    # 1b — fetch direct reports by ManagerId (indexed field, fast)
+    rep_soql = (
+        f"SELECT Id, Name FROM User "
+        f"WHERE ManagerId = '{manager_id}' AND IsActive = true"
+    )
+    try:
+        user_records = _soql_query_all(sid, rep_soql, status_fn=status_fn)
+    except Exception as e:
+        raise ValueError(f"Could not fetch reps under '{manager_name}': {e}")
 
     if not user_records:
         raise ValueError(
