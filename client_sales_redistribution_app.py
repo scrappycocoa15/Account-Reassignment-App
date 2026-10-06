@@ -839,6 +839,75 @@ def fetch_opps_soql(sid: str, owner_id: str,
 
 # ── Return-flow: fetch accounts by FY18 Prev Acct Owner tag ──────────────────
 
+def _probe_fy18_field(sid: str, status_fn=None) -> str | None:
+    """
+    Discover the FY18 Sales Planning field API name without needing an owner_id.
+    Uses describe-based passes first, then falls back to SOQL existence probes
+    (SELECT <cand> FROM Account LIMIT 1) which confirm accessibility without
+    requiring a specific owner to filter on.
+    """
+    import unicodedata
+
+    def _norm(s):
+        s = unicodedata.normalize("NFKC", str(s))
+        s = re.sub(r"\s+", " ", s)
+        return s.lower().strip()
+
+    try:
+        url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
+               f"/sobjects/Account/describe")
+        r = requests.get(url, headers=sf_headers(sid), timeout=30)
+        r.raise_for_status()
+        all_fields = r.json().get("fields", [])
+    except Exception as e:
+        if status_fn:
+            status_fn(f"Describe failed: {e}")
+        all_fields = []
+
+    by_label = {_norm(f["label"]): f for f in all_fields}
+    by_name  = {_norm(f["name"]):  f for f in all_fields}
+
+    # Pass A — exact label
+    if _norm("fy18 sales planning") in by_label:
+        found = by_label[_norm("fy18 sales planning")]["name"]
+        if status_fn:
+            status_fn(f"FY18 field found (label): {found!r}")
+        return found
+
+    # Pass B — known API name candidates
+    for nm in ["fy18_sales_planning__c", "fy18salesplanning__c",
+               "fy18_salesplanning__c", "fy18_sales_plan__c", "fy18__c"]:
+        if nm in by_name:
+            found = by_name[nm]["name"]
+            if status_fn:
+                status_fn(f"FY18 field found (API name): {found!r}")
+            return found
+
+    # Pass C — partial label/name match
+    for f in all_fields:
+        ll = _norm(f["label"])
+        nl = _norm(f["name"])
+        if ("fy18" in ll and "planning" in ll) or \
+           ("fy18" in nl and "planning" in nl):
+            if status_fn:
+                status_fn(f"FY18 field found (partial match): {f['name']!r}")
+            return f["name"]
+
+    # Pass D — SOQL existence probe (no owner filter required)
+    for cand in ["FY18_Sales_Planning__c", "FY18SalesPlanning__c",
+                 "FY18_SalesPlanning__c", "FY18_Sales_Plan__c", "FY18__c"]:
+        try:
+            _soql_query_all(sid, f"SELECT {cand} FROM Account LIMIT 1")
+            if status_fn:
+                status_fn(f"FY18 field found (SOQL probe): {cand!r}")
+            return cand
+        except Exception:
+            continue
+
+    if status_fn:
+        status_fn("FY18 field not found after all passes.")
+    return None
+
 def fetch_accounts_by_tag(sid: str, tag_string: str,
                           manager_filter: str = "",
                           arr_field_override: str = "",
@@ -858,13 +927,19 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
     # ── Discover field API names ────────────────────────────────────────────
     if status_fn:
         status_fn("Discovering ARR and FY18 field API names…")
-    arr_label, arr_api, fy18_label, fy18_api = _discover_account_fields(
+
+    # ARR: reuse full discovery (describe-based passes work without owner_id)
+    arr_label, arr_api, _fy18_ignored, _ignored2 = _discover_account_fields(
         sid, owner_id=None, status_fn=status_fn
     )
     if arr_field_override and arr_field_override.strip():
         arr_api = arr_field_override.strip()
+
+    # FY18: use the targeted probe that doesn't need an owner_id
     if fy18_field_override and fy18_field_override.strip():
         fy18_api = fy18_field_override.strip()
+    else:
+        fy18_api = _probe_fy18_field(sid, status_fn=status_fn)
 
     if not fy18_api:
         raise ValueError(
