@@ -2594,9 +2594,11 @@ def main():
                 )
 
             # Live SFDC lookup
+            lookup_shown_r = False
             if st.session_state.connected and ret_name and not ret_id:
                 results = lookup_user_sfdc(sid, ret_name)
                 if results:
+                    lookup_shown_r = True
                     options = {f"{r['Name']} ({r['Id']})": r for r in results}
                     choice  = st.selectbox("Select rep from Salesforce",
                                            list(options), key="ret_sfdc_sel")
@@ -2608,17 +2610,18 @@ def main():
                         reset_ret_results()
                         st.rerun()
 
-            if st.button("Confirm Rep", key="ret_confirm_rep"):
-                if ret_name and ret_tag and ret_mgr:
-                    st.session_state.ret_rep_name   = ret_name.strip()
-                    st.session_state.ret_rep_id     = ret_id.strip()
-                    st.session_state.ret_tag_string = ret_tag.strip()
-                    st.session_state.ret_manager    = ret_mgr.strip()
-                    reset_ret_results()
-                    _ok(f"Rep set: **{ret_name}** | Matching tag: "
-                        f"*Prev Acct Owner: {ret_tag}* | Manager: *{ret_mgr}*")
-                else:
-                    _warn("Please enter name, original rep's name, and manager.")
+            if not lookup_shown_r:
+                if st.button("Confirm Rep", key="ret_confirm_rep"):
+                    if ret_name and ret_tag and ret_mgr:
+                        st.session_state.ret_rep_name   = ret_name.strip()
+                        st.session_state.ret_rep_id     = ret_id.strip()
+                        st.session_state.ret_tag_string = ret_tag.strip()
+                        st.session_state.ret_manager    = ret_mgr.strip()
+                        reset_ret_results()
+                        _ok(f"Rep set: **{ret_name}** | Matching tag: "
+                            f"*Prev Acct Owner: {ret_tag}* | Manager: *{ret_mgr}*")
+                    else:
+                        _warn("Please enter name, original rep's name, and manager.")
 
         if ret_step1_done:
             _ok(
@@ -2959,9 +2962,11 @@ def main():
                 )
 
             # Live SFDC lookup
+            lookup_shown = False
             if st.session_state.connected and dep_name and not dep_id:
                 results = lookup_user_sfdc(sid, dep_name)
                 if results:
+                    lookup_shown = True
                     options = {f"{r['Name']} ({r['Id']})": r for r in results}
                     choice  = st.selectbox("Select rep from Salesforce", list(options))
                     if st.button("Use this rep"):
@@ -2973,15 +2978,16 @@ def main():
                         reset_results()
                         st.rerun()
 
-            if st.button("Confirm Rep", key="confirm_rep"):
-                if dep_name and dep_id:
-                    st.session_state.departing_name = dep_name.strip()
-                    st.session_state.departing_id   = dep_id.strip()
-                    sfx = f" {tag_suffix.strip()}" if tag_suffix.strip() else ""
-                    st.session_state.tag_name = dep_name.strip() + sfx
-                    reset_results()
-                    _ok(f"Departing rep set: {dep_name} | FY18 tag: "
-                        f"Prev Acct Owner: {st.session_state.tag_name}")
+            if not lookup_shown:
+                if st.button("Confirm Rep", key="confirm_rep"):
+                    if dep_name and dep_id:
+                        st.session_state.departing_name = dep_name.strip()
+                        st.session_state.departing_id   = dep_id.strip()
+                        sfx = f" {tag_suffix.strip()}" if tag_suffix.strip() else ""
+                        st.session_state.tag_name = dep_name.strip() + sfx
+                        reset_results()
+                        _ok(f"Departing rep set: {dep_name} | FY18 tag: "
+                            f"Prev Acct Owner: {st.session_state.tag_name}")
                 else:
                     _warn("Please enter both the rep name and Salesforce User ID.")
 
