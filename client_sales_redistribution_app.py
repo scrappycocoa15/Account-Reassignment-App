@@ -171,6 +171,8 @@ _DEFAULTS = {
     "dropped_acct":     [],
     "dropped_opp":      [],
     "dist_summary":     None,  # DataFrame
+    "result_acct_df":   None,  # DataFrame — for preview
+    "result_opp_df":    None,  # DataFrame — for preview
     # ── return mode ───────────────────────────────────────────────────────────
     "ret_rep_name":     "",
     "ret_rep_id":       "",
@@ -184,6 +186,8 @@ _DEFAULTS = {
     "ret_result_fs":    None,
     "ret_result_filename": "",
     "ret_summary":      None,
+    "ret_result_acct_df": None,  # DataFrame — for preview
+    "ret_result_opp_df":  None,  # DataFrame — for preview
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -191,12 +195,13 @@ for k, v in _DEFAULTS.items():
 
 def reset_results():
     for k in ("result_full", "result_fs", "result_filename", "run_done",
-              "dist_summary"):
+              "dist_summary", "result_acct_df", "result_opp_df"):
         st.session_state[k] = _DEFAULTS[k]
 
 def reset_ret_results():
     for k in ("ret_result_full", "ret_result_fs", "ret_result_filename",
-              "ret_run_done", "ret_summary"):
+              "ret_run_done", "ret_summary",
+              "ret_result_acct_df", "ret_result_opp_df"):
         st.session_state[k] = _DEFAULTS[k]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2254,6 +2259,49 @@ def _info(msg):  st.markdown(f'<div class="info-box">{msg}</div>', unsafe_allow_
 def _warn(msg):  st.markdown(f'<div class="warn-box">{msg}</div>', unsafe_allow_html=True)
 def _ok(msg):    st.markdown(f'<div class="success-box">{msg}</div>', unsafe_allow_html=True)
 
+def _preview_tables(acct_df, opp_df, include_opps,
+                    acct_key="prev_acct", opp_key="prev_opp"):
+    """Render collapsible account + opp preview tables."""
+    # ── Account preview ───────────────────────────────────────────────────────
+    ACCT_PREFER = [
+        "Account Name", "Account Type", "Type",
+        "Contractual ARR (converted)",
+        "Original Account Owner", "Account Owner",
+        "New Account Owner Name",
+        "FY18 Sales Planning", "FY18_Sales_Planning__c",
+        "Rating", "Last Activity",
+    ]
+    acct_show = [c for c in ACCT_PREFER if c in acct_df.columns]
+    # Fallback: show all if none of the preferred cols are present
+    if not acct_show:
+        acct_show = list(acct_df.columns)
+
+    with st.expander(f"Preview accounts ({len(acct_df):,})", expanded=False):
+        st.dataframe(
+            acct_df[acct_show],
+            use_container_width=True,
+            hide_index=True,
+            key=acct_key,
+        )
+
+    # ── Opp preview ───────────────────────────────────────────────────────────
+    if include_opps and opp_df is not None and len(opp_df) > 0:
+        OPP_PREFER = [
+            "Opportunity Name", "Account Name", "Stage", "Close Date",
+            "Forecast Amount", "Opportunity Owner", "New Opp Owner Name",
+        ]
+        opp_show = [c for c in OPP_PREFER if c in opp_df.columns]
+        if not opp_show:
+            opp_show = list(opp_df.columns)
+        with st.expander(f"Preview opportunities ({len(opp_df):,})",
+                         expanded=False):
+            st.dataframe(
+                opp_df[opp_show],
+                use_container_width=True,
+                hide_index=True,
+                key=opp_key,
+            )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2790,6 +2838,8 @@ def main():
                         st.session_state.ret_result_fs       = fs_r
                         st.session_state.ret_result_filename = fname_r
                         st.session_state.ret_summary         = summary_r
+                        st.session_state.ret_result_acct_df  = acct_out_r
+                        st.session_state.ret_result_opp_df   = opp_out_r
                         st.session_state.ret_run_done        = True
                         st.rerun()
 
@@ -2809,6 +2859,14 @@ def main():
                         int(row_r["Opps Assigned"])
                         if st.session_state.ret_include_opps
                         else "Not in scope"),
+            )
+
+            _preview_tables(
+                st.session_state.ret_result_acct_df,
+                st.session_state.ret_result_opp_df,
+                st.session_state.ret_include_opps,
+                acct_key="ret_prev_acct",
+                opp_key="ret_prev_opp",
             )
 
             st.divider()
@@ -3267,6 +3325,8 @@ def main():
                         st.session_state.result_fs       = fs_bytes
                         st.session_state.result_filename = fname
                         st.session_state.dist_summary    = summary
+                        st.session_state.result_acct_df  = acct_out
+                        st.session_state.result_opp_df   = opp_out
                         st.session_state.run_done        = True
                         st.rerun()
 
@@ -3296,6 +3356,14 @@ def main():
             st.dataframe(
                 reps_only[display_cols].style.format({"Account ARR": "${:,.0f}"}),
                 use_container_width=True, hide_index=True
+            )
+
+            _preview_tables(
+                st.session_state.result_acct_df,
+                st.session_state.result_opp_df,
+                st.session_state.include_opps,
+                acct_key="dist_prev_acct",
+                opp_key="dist_prev_opp",
             )
 
             st.divider()
