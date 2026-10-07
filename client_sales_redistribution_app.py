@@ -41,6 +41,24 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # SALESFORCE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUARTER HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _current_and_next_quarter_end() -> tuple:
+    """Return (current_quarter_start, next_quarter_end) as YYYY-MM-DD strings."""
+    from datetime import date, timedelta
+    today  = date.today()
+    q      = (today.month - 1) // 3          # 0-indexed quarter
+    cq_start_month = q * 3 + 1
+    cq_start = date(today.year, cq_start_month, 1)
+    # Next quarter end = first day of quarter after next - 1 day
+    nq     = q + 2                           # quarter index two ahead
+    nq_year  = today.year + nq // 4
+    nq_month = (nq % 4) * 3 + 1
+    nq_end   = date(nq_year, nq_month, 1) - timedelta(days=1)
+    return str(cq_start), str(nq_end)
+
 SF_INSTANCE        = "https://sapconcur.my.salesforce.com"
 SF_API_VER         = "v59.0"
 DEFAULT_ACCT_RPT   = "00OPg00000QkSbp"
@@ -798,12 +816,14 @@ def fetch_opps_soql(sid: str, owner_id: str,
 
     # ── Build SOQL ───────────────────────────────────────────────────────────
     extra_field = f", {amt_api}" if amt_api and amt_api != "Amount" else ""
+    cq_start, nq_end = _current_and_next_quarter_end()
     soql = (
         f"SELECT Id, Name, AccountId, Account.Name, Type, "
-        f"CreatedDate, LeadSource, Amount{extra_field}, CloseDate, StageName, "
+        f"LeadSource, Amount{extra_field}, CloseDate, StageName, "
         f"Owner.Name, OwnerId "
         f"FROM Opportunity "
-        f"WHERE OwnerId = '{owner_id}' AND IsClosed = false"
+        f"WHERE OwnerId = '{owner_id}' AND IsClosed = false "
+        f"AND CloseDate >= {cq_start} AND CloseDate <= {nq_end}"
     )
     if status_fn:
         status_fn(f"Querying open opportunities for owner {owner_id}…")
@@ -829,7 +849,6 @@ def fetch_opps_soql(sid: str, owner_id: str,
             "18 Digit Account ID": rec.get("AccountId", ""),
             "Account Name":        acct.get("Name", ""),
             "Type":                rec.get("Type", "") or "",
-            "Created Date":        str(rec.get("CreatedDate") or ""),
             "Lead Source":         rec.get("LeadSource", "") or "",
             "Forecast Amount":     amt_str,
             "Close Date":          str(rec.get("CloseDate") or ""),
@@ -1070,15 +1089,18 @@ def fetch_opps_by_account_ids(sid: str, account_ids: list,
     BATCH = 500
     all_rows = []
 
+    cq_start, nq_end = _current_and_next_quarter_end()
+
     for i in range(0, len(account_ids), BATCH):
         batch   = account_ids[i : i + BATCH]
         id_list = "', '".join(batch)
         soql    = (
             f"SELECT Id, Name, AccountId, Account.Name, Type, "
-            f"CreatedDate, LeadSource, Amount{extra_field}, CloseDate, "
+            f"LeadSource, Amount{extra_field}, CloseDate, "
             f"StageName, Owner.Name, OwnerId "
             f"FROM Opportunity "
-            f"WHERE IsClosed = false AND AccountId IN ('{id_list}')"
+            f"WHERE IsClosed = false AND AccountId IN ('{id_list}') "
+            f"AND CloseDate >= {cq_start} AND CloseDate <= {nq_end}"
         )
         if status_fn:
             status_fn(f"Fetching opps batch {i//BATCH + 1}…")
@@ -1100,7 +1122,6 @@ def fetch_opps_by_account_ids(sid: str, account_ids: list,
                 "18 Digit Account ID": rec.get("AccountId", ""),
                 "Account Name":        acct.get("Name", ""),
                 "Type":                rec.get("Type", "") or "",
-                "Created Date":        str(rec.get("CreatedDate") or ""),
                 "Lead Source":         rec.get("LeadSource", "") or "",
                 "Forecast Amount":     amt_str,
                 "Close Date":          str(rec.get("CloseDate") or ""),
@@ -2011,7 +2032,8 @@ _FS_ACCT_REQUIRED = [
 ]
 _FS_OPP_REQUIRED  = [
     "ID (18 Char)", "18 Digit Account ID", "Opportunity Name", "Account Name",
-    "New Opp Owner Name",  "New Opp Owner ID",
+    "Stage", "Close Date", "Forecast Amount",
+    "New Opp Owner Name", "New Opp Owner ID",
 ]
 
 def _arr_col_for_fs(df: pd.DataFrame) -> str | None:
@@ -2035,10 +2057,9 @@ def make_fs_acct_df(acct_df: pd.DataFrame) -> pd.DataFrame:
 
 def make_fs_opp_df(opp_df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in _FS_OPP_REQUIRED if c in opp_df.columns]
-    for extra in ["Forecast Amount", "Forecast Amount Currency",
-                  "Stage", "Close Date"]:
-        if extra in opp_df.columns and extra not in cols:
-            cols.append(extra)
+    # Include Opportunity Owner so FS can see who currently holds it
+    if "Opportunity Owner" in opp_df.columns and "Opportunity Owner" not in cols:
+        cols.insert(0, "Opportunity Owner")
     return opp_df[cols].copy()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2271,8 +2292,9 @@ def _preview_tables(acct_df, opp_df, include_opps,
     # ── Opp preview ───────────────────────────────────────────────────────────
     if include_opps and opp_df is not None and len(opp_df) > 0:
         OPP_PREFER = [
-            "Opportunity Name", "Account Name", "Stage", "Close Date",
-            "Forecast Amount", "Opportunity Owner", "New Opp Owner Name",
+            "ID (18 Char)", "Opportunity Name", "Account Name",
+            "Stage", "Close Date", "Forecast Amount",
+            "Opportunity Owner", "New Opp Owner Name", "New Opp Owner ID",
         ]
         opp_show = [c for c in OPP_PREFER if c in opp_df.columns]
         if not opp_show:
