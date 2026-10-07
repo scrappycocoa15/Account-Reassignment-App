@@ -2396,10 +2396,11 @@ def _preview_tables(acct_df, opp_df, include_opps,
     """Render collapsible account + opp preview tables."""
     # ── Account preview ───────────────────────────────────────────────────────
     ACCT_PREFER = [
+        "18 Digit Account ID",
         "Account Name", "Account Type", "Type",
         "Contractual ARR (converted)",
         "Original Account Owner", "Account Owner",
-        "New Account Owner Name",
+        "New Account Owner Name", "New Account Owner ID",
         "FY18 Sales Planning", "FY18_Sales_Planning__c",
         "Rating", "Last Activity",
     ]
