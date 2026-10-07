@@ -2318,182 +2318,9 @@ def main():
         elif st.session_state.conn_msg:
             st.error(st.session_state.conn_msg)
 
-        st.divider()
-        st.markdown("### Field Overrides")
-        arr_field_override = st.text_input(
-            "ARR field API name",
-            value="",
-            placeholder="e.g. Contractual_ARR_USD__c",
-            help="Paste the API Name from the scanner below if auto-discovery fails."
-        )
-        fy18_field_override = st.text_input(
-            "FY18 field API name",
-            value="",
-            placeholder="e.g. FY18_Sales_Planning__c",
-            help="Override FY18 Sales Planning field API name if auto-discovery fails."
-        )
 
-        if st.button("Scan Account fields", use_container_width=True,
-                     help="Lists every numeric/currency field on Account "
-                          "so you can identify the ARR field API name."):
-            if not st.session_state.connected:
-                st.warning("Connect to Salesforce first.")
-            elif not sid:
-                st.warning("Enter Session ID first.")
-            else:
-                with st.spinner("Scanning Account fields…"):
-                    try:
-                        # ── Describe-based list ──────────────────────────────
-                        _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
-                                f"/sobjects/Account/describe")
-                        _r = requests.get(_url, headers=sf_headers(sid), timeout=30)
-                        _r.raise_for_status()
-                        _fields = _r.json().get("fields", [])
-                        _numeric = [
-                            {"Label": f["label"],
-                             "API Name": f["name"],
-                             "Type": f["type"]}
-                            for f in _fields
-                            if f["type"] in ("currency", "double", "int",
-                                             "percent", "number")
-                        ]
-                        if _numeric:
-                            st.caption("Numeric/currency fields from describe:")
-                            st.dataframe(
-                                pd.DataFrame(_numeric),
-                                hide_index=True,
-                                use_container_width=True
-                            )
-                            st.caption(
-                                "Find your ARR field above, copy its API Name, "
-                                "and paste it into the override box."
-                            )
-                        else:
-                            st.info("No numeric/currency fields visible via describe "
-                                    "for this profile — running FIELDS(CUSTOM) probe.")
 
-                        # ── FIELDS(CUSTOM) live probe (bypasses describe FLS) ─
-                        _dep_id = st.session_state.get("departing_id", "")
-                        if _dep_id:
-                            try:
-                                _fsql = (f"SELECT FIELDS(CUSTOM) FROM Account "
-                                         f"WHERE OwnerId = '{_dep_id}' LIMIT 1")
-                                _frecs = _soql_query_all(sid, _fsql)
-                                if _frecs:
-                                    _sample = _frecs[0]
-                                    _live_rows = [
-                                        {"API Name": k,
-                                         "Sample Value": v}
-                                        for k, v in _sample.items()
-                                        if k != "attributes"
-                                        and isinstance(v, (int, float, type(None)))
-                                    ]
-                                    if _live_rows:
-                                        st.caption(
-                                            "Custom fields (live FIELDS(CUSTOM) probe "
-                                            "— bypasses FLS):"
-                                        )
-                                        st.dataframe(
-                                            pd.DataFrame(_live_rows),
-                                            hide_index=True,
-                                            use_container_width=True
-                                        )
-                            except Exception as _fe:
-                                st.caption(f"FIELDS(CUSTOM) probe: {_fe}")
-                        else:
-                            st.caption(
-                                "Enter the departing rep in Step 1 first to "
-                                "enable the live FIELDS(CUSTOM) probe."
-                            )
-                    except Exception as _e:
-                        st.error(f"Describe failed: {_e}")
 
-        if st.button("Scan Opp fields", use_container_width=True,
-                     help="Lists every numeric/currency field on Opportunity "
-                          "so you can identify the Forecast Amount field API name."):
-            if not st.session_state.connected:
-                st.warning("Connect to Salesforce first.")
-            elif not sid:
-                st.warning("Enter Session ID first.")
-            else:
-                with st.spinner("Scanning Opportunity fields…"):
-                    try:
-                        _url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
-                                f"/sobjects/Opportunity/describe")
-                        _r = requests.get(_url, headers=sf_headers(sid), timeout=30)
-                        _r.raise_for_status()
-                        _fields = _r.json().get("fields", [])
-                        _numeric = [
-                            {"Label": f["label"],
-                             "API Name": f["name"],
-                             "Type": f["type"]}
-                            for f in _fields
-                            if f["type"] in ("currency", "double", "int",
-                                             "percent", "number")
-                        ]
-                        if _numeric:
-                            st.caption("Numeric/currency fields from describe:")
-                            st.dataframe(
-                                pd.DataFrame(_numeric),
-                                hide_index=True,
-                                use_container_width=True
-                            )
-                        else:
-                            st.info("No numeric/currency fields visible via describe — "
-                                    "running FIELDS(CUSTOM) probe.")
-
-                        # ── FIELDS(CUSTOM) live probe ────────────────────────
-                        _dep_id = st.session_state.get("departing_id", "")
-                        if _dep_id:
-                            try:
-                                _osql = (
-                                    f"SELECT FIELDS(CUSTOM) FROM Opportunity "
-                                    f"WHERE OwnerId = '{_dep_id}' "
-                                    f"AND IsClosed = false LIMIT 1"
-                                )
-                                _orecs = _soql_query_all(sid, _osql)
-                                if _orecs:
-                                    _osample = _orecs[0]
-                                    _olive = [
-                                        {"API Name": k, "Sample Value": v}
-                                        for k, v in _osample.items()
-                                        if k != "attributes"
-                                        and isinstance(v, (int, float, type(None)))
-                                    ]
-                                    if _olive:
-                                        st.caption(
-                                            "Custom fields (live FIELDS(CUSTOM) probe):"
-                                        )
-                                        st.dataframe(
-                                            pd.DataFrame(_olive),
-                                            hide_index=True,
-                                            use_container_width=True
-                                        )
-                            except Exception as _fe:
-                                st.caption(f"FIELDS(CUSTOM) probe: {_fe}")
-                        else:
-                            st.caption(
-                                "Enter the departing rep in Step 1 first to "
-                                "enable the live FIELDS(CUSTOM) probe."
-                            )
-                    except Exception as _e:
-                        st.error(f"Describe failed: {_e}")
-
-        opp_amount_override = st.text_input(
-            "Opp amount field API name",
-            value="",
-            placeholder="e.g. Forecast_Amount__c",
-            help="Paste the API Name from the Opp scanner above if pipeline "
-                 "shows $0 or is not found."
-        )
-
-        st.divider()
-        st.markdown(
-            "<small>Account and opp data is fetched via SOQL — no row-count "
-            "limits. ARR and Forecast Amount fields are auto-discovered. "
-            "Use the scanners above if auto-discovery misses a field.</small>",
-            unsafe_allow_html=True
-        )
 
     # ── Mode toggle (placed after sidebar so `sid` is already bound) ─────────
     mode_col, _ = st.columns([3, 5])
@@ -2618,74 +2445,133 @@ def main():
             if not ret_step1_done:
                 _info("Complete Step 1 first.")
             else:
-                _info(
-                    "Queries Salesforce for all accounts whose <strong>FY18 Sales "
-                    "Planning</strong> field contains "
-                    f"<strong>Prev Acct Owner: "
-                    f"{st.session_state.ret_tag_string}</strong>."
-                    + (f" Filtered to accounts currently held by reps under "
-                       f"<strong>{st.session_state.ret_manager}</strong>."
-                       if st.session_state.ret_manager else "")
+                src_r = st.radio(
+                    "Data source",
+                    ["Upload file", "Fetch from Salesforce"],
+                    horizontal=True,
+                    key="ret_acct_src",
                 )
-                if not st.session_state.connected:
-                    _warn("Connect to Salesforce first (sidebar).")
-                elif st.button("Fetch accounts from Salesforce",
-                               key="ret_fetch_accts"):
-                    with st.spinner("Querying accounts…"):
+
+                if src_r == "Upload file":
+                    _info(
+                        "Upload the account file (XLS, XLSX, CSV). The app will "
+                        "filter rows whose <strong>FY18 Sales Planning</strong> field "
+                        f"contains <strong>Prev Acct Owner: "
+                        f"{st.session_state.ret_tag_string}</strong>"
+                        + (f", currently held by reps under "
+                           f"<strong>{st.session_state.ret_manager}</strong>."
+                           if st.session_state.ret_manager else ".")
+                    )
+                    f_r = st.file_uploader(
+                        "Account file (XLS, XLSX, CSV)",
+                        type=["xls", "xlsx", "csv"],
+                        key="ret_acct_upload",
+                    )
+                    if f_r and st.button("Load accounts", key="ret_load_file"):
                         try:
-                            # Resolve rep IDs from the roster (no SFDC User query)
-                            roster = (
-                                st.session_state.roster_df
-                                if st.session_state.roster_df is not None
-                                else get_embedded_roster()
-                            )
-                            mgr_filter = st.session_state.ret_manager.strip().lower()
-                            team = roster[
-                                roster["manager"].str.lower().str.contains(
-                                    mgr_filter, na=False
-                                )
-                            ]
-                            if len(team) == 0:
+                            raw = parse_uploaded_file(f_r)
+                            fy18_col_up = detect_fy18_col(raw)
+                            if not fy18_col_up:
                                 st.error(
-                                    f"No reps found under '{st.session_state.ret_manager}' "
-                                    "in the roster. Check the spelling or upload an "
-                                    "updated roster in the Distribute tab."
+                                    "No FY18 Sales Planning column found in the file. "
+                                    "Make sure the file includes that field."
                                 )
                             else:
-                                rep_ids = team["rep_id"].tolist()
-                                msgs = []
-                                rows, _fy18_api, warns = fetch_accounts_by_tag(
-                                    sid,
-                                    tag_string=st.session_state.ret_tag_string,
-                                    rep_ids=rep_ids,
-                                    manager_name=st.session_state.ret_manager,
-                                    arr_field_override=arr_field_override,
-                                    fy18_field_override=fy18_field_override,
-                                    status_fn=lambda m: msgs.append(m),
+                                needle = (
+                                    f"prev acct owner: "
+                                    f"{st.session_state.ret_tag_string}".lower()
                                 )
-                                if not rows:
+                                mask = raw[fy18_col_up].astype(str).str.lower().str.contains(
+                                    needle, na=False
+                                )
+                                # Optional manager filter
+                                if st.session_state.ret_manager:
+                                    mgr_col = _find_col(raw, ["manager"])
+                                    if mgr_col:
+                                        mgr_mask = raw[mgr_col].astype(str).str.lower().str.contains(
+                                            st.session_state.ret_manager.lower(), na=False
+                                        )
+                                        mask = mask & mgr_mask
+                                df = raw[mask].reset_index(drop=True)
+                                if len(df) == 0:
                                     _warn(
                                         f"No accounts found with tag "
                                         f"'Prev Acct Owner: "
-                                        f"{st.session_state.ret_tag_string}'. "
-                                        "Check the tag string or manager name."
+                                        f"{st.session_state.ret_tag_string}'."
                                     )
                                 else:
-                                    df = pd.DataFrame(rows).fillna("")
                                     st.session_state.ret_acct_df = df
                                     reset_ret_results()
-                                    for w in warns:
-                                        _warn(w)
-                                    if msgs:
-                                        with st.expander("Fetch details",
-                                                         expanded=False):
-                                            for m in msgs:
-                                                st.caption(m)
                                     st.rerun()
-                        except ValueError as ve:
-                            st.error(str(ve))
                         except Exception as e:
-                            st.error(f"Account fetch failed: {e}")
+                            st.error(f"Could not parse file: {e}")
+
+                else:  # Fetch from Salesforce
+                    _info(
+                        "Queries Salesforce for all accounts whose <strong>FY18 Sales "
+                        "Planning</strong> field contains "
+                        f"<strong>Prev Acct Owner: "
+                        f"{st.session_state.ret_tag_string}</strong>."
+                        + (f" Filtered to accounts currently held by reps under "
+                           f"<strong>{st.session_state.ret_manager}</strong>."
+                           if st.session_state.ret_manager else "")
+                    )
+                    if not st.session_state.connected:
+                        _warn("Connect to Salesforce first (sidebar).")
+                    elif st.button("Fetch accounts from Salesforce",
+                                   key="ret_fetch_accts"):
+                        with st.spinner("Querying accounts…"):
+                            try:
+                                roster = (
+                                    st.session_state.roster_df
+                                    if st.session_state.roster_df is not None
+                                    else get_embedded_roster()
+                                )
+                                mgr_filter = st.session_state.ret_manager.strip().lower()
+                                team = roster[
+                                    roster["manager"].str.lower().str.contains(
+                                        mgr_filter, na=False
+                                    )
+                                ]
+                                if len(team) == 0:
+                                    st.error(
+                                        f"No reps found under '{st.session_state.ret_manager}' "
+                                        "in the roster. Check the spelling or upload an "
+                                        "updated roster in the Distribute tab."
+                                    )
+                                else:
+                                    rep_ids = team["rep_id"].tolist()
+                                    msgs = []
+                                    rows, _fy18_api, warns = fetch_accounts_by_tag(
+                                        sid,
+                                        tag_string=st.session_state.ret_tag_string,
+                                        rep_ids=rep_ids,
+                                        manager_name=st.session_state.ret_manager,
+                                        status_fn=lambda m: msgs.append(m),
+                                    )
+                                    if not rows:
+                                        _warn(
+                                            f"No accounts found with tag "
+                                            f"'Prev Acct Owner: "
+                                            f"{st.session_state.ret_tag_string}'. "
+                                            "Check the tag string or manager name."
+                                        )
+                                    else:
+                                        df = pd.DataFrame(rows).fillna("")
+                                        st.session_state.ret_acct_df = df
+                                        reset_ret_results()
+                                        for w in warns:
+                                            _warn(w)
+                                        if msgs:
+                                            with st.expander("Fetch details",
+                                                             expanded=False):
+                                                for m in msgs:
+                                                    st.caption(m)
+                                        st.rerun()
+                            except ValueError as ve:
+                                st.error(str(ve))
+                            except Exception as e:
+                                st.error(f"Account fetch failed: {e}")
 
         if ret_step2_done:
             df = st.session_state.ret_acct_df
@@ -3047,7 +2933,6 @@ def main():
                                         rows, warns = fetch_accounts_soql(
                                             sid,
                                             owner_id=st.session_state.departing_id,
-                                            arr_field_override=arr_field_override,
                                             status_fn=lambda m: msgs.append(m)
                                         )
                                         df = pd.DataFrame(rows).fillna("")
@@ -3245,7 +3130,6 @@ def main():
                                         rows, warns = fetch_opps_soql(
                                             sid,
                                             owner_id=st.session_state.departing_id,
-                                            amount_field_override=opp_amount_override,
                                             status_fn=lambda m: msgs2.append(m)
                                         )
                                         st.session_state.opp_df      = pd.DataFrame(rows).fillna("")
