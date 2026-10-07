@@ -2980,7 +2980,7 @@ def main():
 
             if not lookup_shown:
                 if st.button("Confirm Rep", key="confirm_rep"):
-                    if dep_name and dep_id:
+                    if dep_name:
                         st.session_state.departing_name = dep_name.strip()
                         st.session_state.departing_id   = dep_id.strip()
                         sfx = f" {tag_suffix.strip()}" if tag_suffix.strip() else ""
@@ -2988,8 +2988,8 @@ def main():
                         reset_results()
                         _ok(f"Departing rep set: {dep_name} | FY18 tag: "
                             f"Prev Acct Owner: {st.session_state.tag_name}")
-                else:
-                    _warn("Please enter both the rep name and Salesforce User ID.")
+                    else:
+                        _warn("Please enter the rep's name.")
 
         if step1_done:
             _ok(f"Departing rep: **{st.session_state.departing_name}** "
