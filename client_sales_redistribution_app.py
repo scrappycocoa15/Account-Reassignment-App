@@ -2131,24 +2131,63 @@ def _arr_col_for_fs(df: pd.DataFrame) -> str | None:
     return None
 
 def make_fs_acct_df(acct_df: pd.DataFrame) -> pd.DataFrame:
-    arr_col  = _arr_col_for_fs(acct_df)
-    fy18_col = detect_fy18_col(acct_df)
-    cols = [c for c in _FS_ACCT_REQUIRED if c in acct_df.columns]
-    if arr_col and arr_col not in cols:
-        cols.append(arr_col)
-    if fy18_col and fy18_col not in cols:
-        cols.append(fy18_col)
-    # Preserve original owner for Field Services reference
-    if "Account Owner" in acct_df.columns and "Account Owner" not in cols:
-        cols.insert(0, "Account Owner")
-    return acct_df[cols].copy()
+    """
+    Build the slim FS attachment for account updates.
+    Uses flexible column matching so uploaded files and SFDC-fetched data
+    both produce the correct output regardless of minor name variations.
+    """
+    def _pick(*candidates):
+        """Return the first column name found in acct_df (case-insensitive)."""
+        return _find_col(acct_df, [c.lower() for c in candidates])
+
+    # Ordered list of (desired_label, flexible_candidates)
+    want = [
+        ("18 Digit Account ID",     ["18 digit account id", "account id", "id"]),
+        ("Account Name",            ["account name", "name"]),
+        ("Original Account Owner",  ["original account owner"]),   # return flow
+        ("Account Owner",           ["account owner"]),
+        ("New Account Owner Name",  ["new account owner name", "new owner name"]),
+        ("New Account Owner ID",    ["new account owner id", "new owner id"]),
+        ("Account Type",            ["account type", "type"]),
+        ("Contractual ARR",         None),   # handled separately via detect_arr_col
+        ("FY18 Sales Planning",     None),   # handled separately via detect_fy18_col
+    ]
+
+    cols = []
+    for _label, candidates in want:
+        if candidates is None:
+            continue
+        col = _find_col(acct_df, candidates)
+        if col and col not in cols:
+            cols.append(col)
+
+    # ARR and FY18 via dedicated detectors (handles API name variants)
+    for col in [detect_arr_col(acct_df), detect_fy18_col(acct_df)]:
+        if col and col not in cols:
+            cols.append(col)
+
+    # Fallback: return full df if nothing matched (shouldn't happen)
+    return acct_df[cols].copy() if cols else acct_df.copy()
 
 def make_fs_opp_df(opp_df: pd.DataFrame) -> pd.DataFrame:
-    cols = [c for c in _FS_OPP_REQUIRED if c in opp_df.columns]
-    # Include Opportunity Owner so FS can see who currently holds it
-    if "Opportunity Owner" in opp_df.columns and "Opportunity Owner" not in cols:
-        cols.insert(0, "Opportunity Owner")
-    return opp_df[cols].copy()
+    want = [
+        ["opportunity owner"],
+        ["id (18 char)", "id", "opportunity id"],
+        ["18 digit account id", "account id"],
+        ["opportunity name", "name"],
+        ["account name"],
+        ["stage", "stagename"],
+        ["close date", "closedate"],
+        ["forecast amount", "amount"],
+        ["new opp owner name", "new owner name"],
+        ["new opp owner id",   "new owner id"],
+    ]
+    cols = []
+    for candidates in want:
+        col = _find_col(opp_df, candidates)
+        if col and col not in cols:
+            cols.append(col)
+    return opp_df[cols].copy() if cols else opp_df.copy()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXCEL GENERATION
