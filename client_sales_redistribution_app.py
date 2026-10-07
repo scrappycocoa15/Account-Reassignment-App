@@ -817,6 +817,25 @@ def fetch_opps_soql(sid: str, owner_id: str,
     # ── Build SOQL ───────────────────────────────────────────────────────────
     extra_field = f", {amt_api}" if amt_api and amt_api != "Amount" else ""
     cq_start, nq_end = _current_and_next_quarter_end()
+
+    # Discover "Date Stamp Sales Working" field — filters to pipeline opps only
+    sw_field = _probe_opp_field(
+        sid,
+        label_fragment="sales working",
+        candidates=[
+            "Date_Stamp_Sales_Working__c",
+            "DateStampSalesWorking__c",
+            "Date_Stamp_Working__c",
+            "Sales_Working_Date__c",
+            "Sales_Working__c",
+        ],
+        status_fn=status_fn,
+    )
+    sw_filter = f" AND {sw_field} != null" if sw_field else ""
+    if not sw_field and status_fn:
+        status_fn("WARNING: 'Date Stamp Sales Working' field not found — "
+                  "all open opps in close-date range will be included.")
+
     soql = (
         f"SELECT Id, Name, AccountId, Account.Name, Type, "
         f"LeadSource, Amount{extra_field}, CloseDate, StageName, "
@@ -824,6 +843,7 @@ def fetch_opps_soql(sid: str, owner_id: str,
         f"FROM Opportunity "
         f"WHERE OwnerId = '{owner_id}' AND IsClosed = false "
         f"AND CloseDate >= {cq_start} AND CloseDate <= {nq_end}"
+        f"{sw_filter}"
     )
     if status_fn:
         status_fn(f"Querying open opportunities for owner {owner_id}…")
@@ -863,7 +883,50 @@ def fetch_opps_soql(sid: str, owner_id: str,
 
 # ── Return-flow: fetch accounts by FY18 Prev Acct Owner tag ──────────────────
 
-def _probe_fy18_field(sid: str, status_fn=None) -> str | None:
+def _probe_opp_field(sid: str, label_fragment: str,
+                     candidates: list, status_fn=None) -> str | None:
+    """
+    Discover a custom Opportunity field API name via describe then SOQL probe.
+    label_fragment: lowercase substring to match against field labels.
+    candidates: ordered list of API name guesses to try as SOQL probes.
+    Returns the API name or None.
+    """
+    import unicodedata
+
+    def _norm(s):
+        s = unicodedata.normalize("NFKC", str(s))
+        s = re.sub(r"\s+", " ", s)
+        return s.lower().strip()
+
+    try:
+        url = (f"{SF_INSTANCE}/services/data/{SF_API_VER}"
+               f"/sobjects/Opportunity/describe")
+        r = requests.get(url, headers=sf_headers(sid), timeout=30)
+        r.raise_for_status()
+        all_fields = r.json().get("fields", [])
+    except Exception:
+        all_fields = []
+
+    # Pass A — label contains the fragment
+    for f in all_fields:
+        if label_fragment in _norm(f["label"]):
+            if status_fn:
+                status_fn(f"Opp field '{label_fragment}' found via label: {f['name']!r}")
+            return f["name"]
+
+    # Pass B — SOQL existence probe (no WHERE filter needed, just confirms field exists)
+    for cand in candidates:
+        try:
+            _soql_query_all(sid, f"SELECT {cand} FROM Opportunity LIMIT 1")
+            if status_fn:
+                status_fn(f"Opp field '{label_fragment}' found via probe: {cand!r}")
+            return cand
+        except Exception:
+            continue
+
+    if status_fn:
+        status_fn(f"Opp field '{label_fragment}' not found — filter will be skipped.")
+    return None
     """
     Discover the FY18 Sales Planning field API name without needing an owner_id.
     Uses describe-based passes first, then falls back to SOQL existence probes
@@ -1091,6 +1154,20 @@ def fetch_opps_by_account_ids(sid: str, account_ids: list,
 
     cq_start, nq_end = _current_and_next_quarter_end()
 
+    sw_field = _probe_opp_field(
+        sid,
+        label_fragment="sales working",
+        candidates=[
+            "Date_Stamp_Sales_Working__c",
+            "DateStampSalesWorking__c",
+            "Date_Stamp_Working__c",
+            "Sales_Working_Date__c",
+            "Sales_Working__c",
+        ],
+        status_fn=status_fn,
+    )
+    sw_filter = f" AND {sw_field} != null" if sw_field else ""
+
     for i in range(0, len(account_ids), BATCH):
         batch   = account_ids[i : i + BATCH]
         id_list = "', '".join(batch)
@@ -1101,6 +1178,7 @@ def fetch_opps_by_account_ids(sid: str, account_ids: list,
             f"FROM Opportunity "
             f"WHERE IsClosed = false AND AccountId IN ('{id_list}') "
             f"AND CloseDate >= {cq_start} AND CloseDate <= {nq_end}"
+            f"{sw_filter}"
         )
         if status_fn:
             status_fn(f"Fetching opps batch {i//BATCH + 1}…")
