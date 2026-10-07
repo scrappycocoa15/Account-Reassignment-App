@@ -818,7 +818,10 @@ def fetch_opps_soql(sid: str, owner_id: str,
     extra_field = f", {amt_api}" if amt_api and amt_api != "Amount" else ""
     cq_start, nq_end = _current_and_next_quarter_end()
 
-    # Discover "Date Stamp Sales Working" field — filters to pipeline opps only
+    # Discover "Date Stamp Sales Working" field
+    # We SELECT it and filter in Python rather than in SOQL WHERE — SOQL can
+    # silently return null for formula/FLS-restricted fields even when the UI
+    # shows a value, which would incorrectly drop valid pipeline opps.
     sw_field = _probe_opp_field(
         sid,
         label_fragment="sales working",
@@ -831,7 +834,7 @@ def fetch_opps_soql(sid: str, owner_id: str,
         ],
         status_fn=status_fn,
     )
-    sw_filter = f" AND {sw_field} != null" if sw_field else ""
+    sw_select = f", {sw_field}" if sw_field else ""
     if not sw_field and status_fn:
         status_fn("WARNING: 'Date Stamp Sales Working' field not found — "
                   "all open opps in close-date range will be included.")
@@ -839,18 +842,23 @@ def fetch_opps_soql(sid: str, owner_id: str,
     soql = (
         f"SELECT Id, Name, AccountId, Account.Name, Type, "
         f"LeadSource, Amount{extra_field}, CloseDate, StageName, "
-        f"Owner.Name, OwnerId "
+        f"Owner.Name, OwnerId{sw_select} "
         f"FROM Opportunity "
         f"WHERE OwnerId = '{owner_id}' AND IsClosed = false "
         f"AND CloseDate >= {cq_start} AND CloseDate <= {nq_end}"
-        f"{sw_filter}"
     )
     if status_fn:
         status_fn(f"Querying open opportunities for owner {owner_id}…")
     records = _soql_query_all(sid, soql, status_fn=status_fn)
+    if status_fn:
+        status_fn(f"Fetched {len(records):,} opps — applying Sales Working filter in Python…")
 
     rows = []
     for rec in records:
+        # Filter: Date Stamp Sales Working must be non-null
+        if sw_field and not rec.get(sw_field):
+            continue
+
         acct  = rec.get("Account") or {}
         owner = rec.get("Owner")   or {}
 
@@ -1166,7 +1174,7 @@ def fetch_opps_by_account_ids(sid: str, account_ids: list,
         ],
         status_fn=status_fn,
     )
-    sw_filter = f" AND {sw_field} != null" if sw_field else ""
+    sw_select = f", {sw_field}" if sw_field else ""
 
     for i in range(0, len(account_ids), BATCH):
         batch   = account_ids[i : i + BATCH]
@@ -1174,17 +1182,19 @@ def fetch_opps_by_account_ids(sid: str, account_ids: list,
         soql    = (
             f"SELECT Id, Name, AccountId, Account.Name, Type, "
             f"LeadSource, Amount{extra_field}, CloseDate, "
-            f"StageName, Owner.Name, OwnerId "
+            f"StageName, Owner.Name, OwnerId{sw_select} "
             f"FROM Opportunity "
             f"WHERE IsClosed = false AND AccountId IN ('{id_list}') "
             f"AND CloseDate >= {cq_start} AND CloseDate <= {nq_end}"
-            f"{sw_filter}"
         )
         if status_fn:
             status_fn(f"Fetching opps batch {i//BATCH + 1}…")
         records = _soql_query_all(sid, soql, status_fn=status_fn)
 
         for rec in records:
+            # Filter in Python: Date Stamp Sales Working must be non-null
+            if sw_field and not rec.get(sw_field):
+                continue
             acct  = rec.get("Account") or {}
             owner = rec.get("Owner")   or {}
             raw_amt = rec.get(amt_api) if amt_api else None
