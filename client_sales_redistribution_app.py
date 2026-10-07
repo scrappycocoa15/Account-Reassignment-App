@@ -989,6 +989,11 @@ def fetch_accounts_by_tag(sid: str, tag_string: str,
             f"Fetched {len(all_records):,} total accounts "
             f"— filtering for 'Prev Acct Owner: {tag_string}'..."
         )
+        status_fn(f"FY18 field in use: {fy18_api!r}")
+        # Sample a few FY18 values to confirm field is populated
+        samples = [str(r.get(fy18_api) or "") for r in all_records[:5]]
+        for i, s in enumerate(samples):
+            status_fn(f"  Sample {i+1} FY18 value: {s[:120]!r}")
 
     # Filter FY18 content in Python (safe for Long Text Area fields)
     needle = f"prev acct owner: {tag_string}".lower()
@@ -2412,7 +2417,8 @@ def main():
                         picked = options[choice]
                         st.session_state.ret_rep_name   = picked["Name"]
                         st.session_state.ret_rep_id     = picked["Id"]
-                        st.session_state.ret_tag_string = picked["Name"]
+                        st.session_state.ret_tag_string = ret_tag.strip() or picked["Name"]
+                        st.session_state.ret_manager    = ret_mgr.strip()
                         reset_ret_results()
                         st.rerun()
 
@@ -2564,7 +2570,7 @@ def main():
                                             _warn(w)
                                         if msgs:
                                             with st.expander("Fetch details",
-                                                             expanded=False):
+                                                             expanded=True):
                                                 for m in msgs:
                                                     st.caption(m)
                                         st.rerun()
